@@ -16,10 +16,10 @@ lint: vet
 	golangci-lint run
 
 run:
-	set -a; [ -f .env ] && . ./.env; set +a; go run $(PKG)
+	go run $(PKG)
 
 dry-run:
-	set -a; [ -f .env ] && . ./.env; set +a; go run $(PKG) --once --dry-run
+	go run $(PKG) --once --dry-run
 
 tidy:
 	go mod tidy

@@ -27,7 +27,11 @@ Poll Jira for unresolved bugs assigned to me → notify via Telegram with action
 | `SNOOZE_CHOICES` | `30m,2h,24h` | buttons for "Remind me after…" |
 | `DB_PATH` | `./data/tasks.db` | `/data/tasks.db` in Docker |
 
-CLI flags: `--once` (single cycle then exit), `--dry-run` (print to stdout, no Telegram).
+CLI flags: `--once` (single cycle then exit), `--dry-run` (print to stdout, no Telegram; DB is still updated; Telegram vars not validated), `--env-file` (default `.env`).
+
+`.env` is read by the binary itself with literal values (same as `docker compose env_file`): no shell quoting needed, real env vars take precedence. `JIRA_BASE_URL` must be the Jira root — page URLs (`/secure/…`, `/browse/…`, query strings) are rejected. `TELEGRAM_CHAT_ID` is the numeric chat id, not the bot username.
+
+Sync rules: a failed Jira request never closes tasks; a closed task that matches the JQL again is reopened as `new`.
 
 ## Data model
 `tasks`: `jira_key` PK, `summary`, `priority`, `jira_status`, `url`, `state`, `tg_message_id`, `last_notified_at`, `remind_at`, `jira_updated`, `created_at`, `updated_at`.

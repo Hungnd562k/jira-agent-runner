@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -52,19 +53,19 @@ func Load(requireTelegram bool) (*Config, error) {
 		errs = append(errs, fmt.Errorf("SNOOZE_CHOICES: %w", err))
 	}
 
-	if c.JiraBaseURL == "" {
-		errs = append(errs, errors.New("JIRA_BASE_URL is required"))
+	if err := validateBaseURL(c.JiraBaseURL); err != nil {
+		errs = append(errs, err)
 	}
 	if c.JiraPAT == "" {
 		errs = append(errs, errors.New("JIRA_PAT is required"))
 	}
 
-	if raw := os.Getenv("TELEGRAM_CHAT_ID"); raw != "" {
-		if c.TelegramChatID, err = strconv.ParseInt(raw, 10, 64); err != nil {
-			errs = append(errs, fmt.Errorf("TELEGRAM_CHAT_ID: %w", err))
-		}
-	}
 	if requireTelegram {
+		if raw := os.Getenv("TELEGRAM_CHAT_ID"); raw != "" {
+			if c.TelegramChatID, err = strconv.ParseInt(raw, 10, 64); err != nil {
+				errs = append(errs, fmt.Errorf("TELEGRAM_CHAT_ID must be a numeric chat id (got %q)", raw))
+			}
+		}
 		if c.TelegramBotToken == "" {
 			errs = append(errs, errors.New("TELEGRAM_BOT_TOKEN is required"))
 		}
@@ -77,6 +78,27 @@ func Load(requireTelegram bool) (*Config, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// validateBaseURL rejects page URLs pasted from the browser (boards, issues, REST paths).
+func validateBaseURL(raw string) error {
+	if raw == "" {
+		return errors.New("JIRA_BASE_URL is required")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("JIRA_BASE_URL must be an http(s) URL, got %q", raw)
+	}
+	bad := u.RawQuery != "" || u.Fragment != ""
+	for _, seg := range []string{"/secure/", "/browse/", "/rest/", "/projects/"} {
+		if strings.Contains(u.Path+"/", seg) {
+			bad = true
+		}
+	}
+	if bad {
+		return fmt.Errorf("JIRA_BASE_URL must be the Jira root (e.g. %s://%s), not a page URL", u.Scheme, u.Host)
+	}
+	return nil
 }
 
 func getenv(key, def string) string {

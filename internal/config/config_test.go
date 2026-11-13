@@ -42,3 +42,19 @@ func TestParseDurationsRejectsInvalid(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateBaseURL(t *testing.T) {
+	ok := []string{"https://jira.example.com", "https://example.com/jira"}
+	bad := []string{"", "jira.example.com", "https://jira.example.com/secure/RapidBoard.jspa?rapidView=1",
+		"https://jira.example.com/browse/X-1", "https://jira.example.com/?a=b"}
+	for _, u := range ok {
+		if err := validateBaseURL(u); err != nil {
+			t.Errorf("validateBaseURL(%q) = %v", u, err)
+		}
+	}
+	for _, u := range bad {
+		if err := validateBaseURL(u); err == nil {
+			t.Errorf("validateBaseURL(%q) expected error", u)
+		}
+	}
+}
