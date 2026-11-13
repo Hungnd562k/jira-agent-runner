@@ -5,7 +5,7 @@ Service that polls Jira (Server/DC) for assigned bugs, asks for approval in Tele
 ## Stack & principles
 - Go (see `go.mod`), single static binary, `CGO_ENABLED=0`. Lightweight is a hard requirement: prefer stdlib, add a dependency only when it clearly pays off.
 - SQLite via `modernc.org/sqlite`; schema changes go in embedded migration files under `internal/store/`, never ad-hoc `ALTER` in code.
-- Jira: REST API v2 with Bearer PAT, plain `net/http`. Telegram: long polling via `github.com/go-telegram/bot`.
+- Jira: REST API v2 with Bearer PAT, plain `net/http`. Telegram: long polling via the own minimal client in `internal/telegram` (`net/http`, no lib).
 - Logging: `log/slog`. Never log tokens/PATs.
 - Config only from env (`internal/config`); every new var goes into `.env.example` and the SPEC table.
 

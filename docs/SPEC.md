@@ -9,7 +9,7 @@ Poll Jira for unresolved bugs assigned to me → notify via Telegram with action
 | Language | Go (single static binary, `CGO_ENABLED=0`) |
 | Database | SQLite via `modernc.org/sqlite` (pure Go), migrations embedded with `//go:embed` |
 | Jira | Server/Data Center, REST API v2 (`/rest/api/2/search`), `Authorization: Bearer <PAT>` |
-| Telegram | Bot API, **long polling** (`getUpdates`) — no public URL needed. Lib: `github.com/go-telegram/bot` |
+| Telegram | Bot API, **long polling** (`getUpdates`) — no public URL needed. Own minimal client on `net/http` (no dependency); throttled ~1 msg/s, one retry on HTTP 429 |
 | Deploy | Docker, multi-stage → `gcr.io/distroless/static`, volume `./data:/data`, `mem_limit: 64m` |
 | Phase 2 agent | Claude Code CLI headless (`claude -p`) in sandbox container |
 | Phase 2 MR | GitLab API, draft MR (`Draft:` title prefix) |

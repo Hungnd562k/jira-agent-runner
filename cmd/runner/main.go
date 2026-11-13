@@ -18,6 +18,9 @@ import (
 	"github.com/Hungnd562k/jira-agent-runner/internal/jira"
 	"github.com/Hungnd562k/jira-agent-runner/internal/scheduler"
 	"github.com/Hungnd562k/jira-agent-runner/internal/store"
+	"github.com/Hungnd562k/jira-agent-runner/internal/telegram"
+
+	_ "time/tzdata" // embed zoneinfo so TZ works in distroless
 )
 
 func main() {
@@ -62,22 +65,35 @@ func run(log *slog.Logger, once, dryRun bool) error {
 	log.Info("jira-agent-runner starting", "once", once, "dry_run", dryRun,
 		"jira", cfg.JiraBaseURL, "db", cfg.DBPath, "poll", cfg.PollInterval)
 
-	res, err := syncer.Sync(ctx)
-	if err != nil {
-		return err
-	}
-	log.Info("sync done", "issues", len(res.Issues), "created", len(res.Created),
-		"updated", len(res.Updated), "reopened", len(res.Reopened), "closed", len(res.Closed))
-
 	if dryRun {
+		res, err := syncer.Sync(ctx)
+		if err != nil {
+			return err
+		}
 		printResult(os.Stdout, res)
+		return nil
 	}
-	if !once {
-		// TODO(M2/M3): Telegram notifier + poll/remind loops.
-		log.Warn("long-running mode not implemented yet (M3); exiting after one cycle")
+
+	svc := &scheduler.Service{
+		Syncer:        syncer,
+		Store:         st,
+		TG:            telegram.New(telegramAPI, cfg.TelegramBotToken),
+		ChatID:        cfg.TelegramChatID,
+		SnoozeChoices: cfg.SnoozeChoices,
+		PollInterval:  cfg.PollInterval,
+		SendGap:       time.Second,
+		Now:           time.Now,
+		Log:           log,
 	}
-	return nil
+	if once {
+		return svc.Cycle(ctx)
+	}
+	err = svc.Run(ctx)
+	log.Info("shutting down")
+	return err
 }
+
+const telegramAPI = "https://api.telegram.org"
 
 func printResult(w io.Writer, res *scheduler.SyncResult) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
