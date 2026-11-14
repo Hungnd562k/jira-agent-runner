@@ -58,3 +58,25 @@ func TestValidateBaseURL(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadWorker(t *testing.T) {
+	t.Setenv("GITLAB_BASE_URL", "")
+	t.Setenv("GITLAB_TOKEN", "")
+	t.Setenv("WORKTREE_DIR", "/tmp/wt")
+	if _, err := LoadWorker(true); err == nil {
+		t.Fatal("expected GitLab settings to be required")
+	}
+	w, err := LoadWorker(false)
+	if err != nil || w.AgentTimeout != 30*time.Minute || w.AgentMaxBudgetUSD != 5 || w.ClaudeBin != "claude" {
+		t.Fatalf("LoadWorker(no-push) = %+v %v", w, err)
+	}
+	t.Setenv("GITLAB_BASE_URL", "https://git.example.com/group/proj/-/merge_requests")
+	t.Setenv("GITLAB_TOKEN", "x")
+	if _, err := LoadWorker(true); err == nil {
+		t.Fatal("page URL should be rejected")
+	}
+	t.Setenv("GITLAB_BASE_URL", "https://git.example.com")
+	if _, err := LoadWorker(true); err != nil {
+		t.Fatal(err)
+	}
+}

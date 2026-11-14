@@ -22,6 +22,17 @@ func (s *Store) transition(ctx context.Context, key string, from []State, to Sta
 	}
 	defer tx.Rollback()
 
+	t, err := transitionTx(ctx, tx, key, from, to, set, args, event, payload, now)
+	if err != nil {
+		return Task{}, err
+	}
+	return t, tx.Commit()
+}
+
+// transitionTx is transition inside a caller-owned transaction.
+func transitionTx(ctx context.Context, tx *sql.Tx, key string, from []State, to State,
+	set string, args []any, event, payload string, now time.Time) (Task, error) {
+
 	var cur State
 	if err := tx.QueryRowContext(ctx, `SELECT state FROM tasks WHERE jira_key = ?`, key).Scan(&cur); err != nil {
 		return Task{}, err
@@ -44,11 +55,7 @@ func (s *Store) transition(ctx context.Context, key string, from []State, to Sta
 		return Task{}, err
 	}
 
-	t, err := scanTask(tx.QueryRowContext(ctx, selectTask+` WHERE jira_key = ?`, key))
-	if err != nil {
-		return Task{}, err
-	}
-	return t, tx.Commit()
+	return scanTask(tx.QueryRowContext(ctx, selectTask+` WHERE jira_key = ?`, key))
 }
 
 // MarkNotified records that a notice (or reminder) was sent as messageID.

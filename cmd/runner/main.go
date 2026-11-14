@@ -17,6 +17,7 @@ import (
 
 	"github.com/Hungnd562k/jira-agent-runner/internal/config"
 	"github.com/Hungnd562k/jira-agent-runner/internal/jira"
+	"github.com/Hungnd562k/jira-agent-runner/internal/repos"
 	"github.com/Hungnd562k/jira-agent-runner/internal/scheduler"
 	"github.com/Hungnd562k/jira-agent-runner/internal/store"
 	"github.com/Hungnd562k/jira-agent-runner/internal/telegram"
@@ -29,6 +30,9 @@ func main() {
 	dryRun := flag.Bool("dry-run", false, "print issues to stdout instead of sending Telegram messages (DB is still updated)")
 	envFile := flag.String("env-file", ".env", "dotenv file to load; empty disables (missing file is ignored; real env vars take precedence)")
 	healthcheck := flag.Bool("healthcheck", false, "exit 0 if the running service's heartbeat is fresh (for Docker HEALTHCHECK)")
+	workerMode := flag.Bool("worker", false, "run the agent worker (on the host): process approved jobs instead of polling Jira")
+	noPush := flag.Bool("no-push", false, "worker: commit on a local branch only; do not push or open a merge request")
+	publishJob := flag.Int64("publish-job", 0, "worker: push + open the Draft MR for an existing job whose agent run succeeded but push/MR failed, then exit")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -41,7 +45,11 @@ func main() {
 	if *healthcheck {
 		os.Exit(checkHeartbeat(heartbeatPath()))
 	}
-	if err := run(log, *once, *dryRun); err != nil {
+	run := func() error { return run(log, *once, *dryRun) }
+	if *workerMode {
+		run = func() error { return runWorker(log, *once, *noPush, *publishJob) }
+	}
+	if err := run(); err != nil {
 		log.Error("fatal", "err", err)
 		os.Exit(1)
 	}
@@ -81,12 +89,19 @@ func run(log *slog.Logger, once, dryRun bool) error {
 		return nil
 	}
 
+	repoCfg, err := repos.Load(cfg.ReposFile)
+	if err != nil {
+		return fmt.Errorf("load repos: %w", err)
+	}
+	log.Info("repos loaded", "file", cfg.ReposFile, "projects", len(repoCfg))
+
 	svc := &scheduler.Service{
 		Syncer:        syncer,
 		Store:         st,
 		TG:            telegram.New(telegramAPI, cfg.TelegramBotToken),
 		ChatID:        cfg.TelegramChatID,
 		SnoozeChoices: cfg.SnoozeChoices,
+		Repos:         repoCfg,
 		PollInterval:  cfg.PollInterval,
 		RemindAfter:   cfg.RemindInterval,
 		RemindCheck:   time.Minute,

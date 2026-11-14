@@ -1,0 +1,22 @@
+# systemd *user* unit for the agent worker.
+# Install:
+#   cp deploy/jira-agent-worker.service ~/.config/systemd/user/
+#   (edit WorkingDirectory / ExecStart below to your checkout)
+#   systemctl --user daemon-reload && systemctl --user enable --now jira-agent-worker
+#   journalctl --user -u jira-agent-worker -f
+[Unit]
+Description=jira-agent-runner worker (Claude Code -> GitLab draft MR)
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/private/jira-agent-runner
+ExecStart=%h/private/jira-agent-runner/bin/runner --worker
+# claude, git and toolchains must be on PATH for the worker.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=30
+# Let a running agent finish its current step on stop.
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

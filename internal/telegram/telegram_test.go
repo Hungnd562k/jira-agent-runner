@@ -81,3 +81,19 @@ func TestClientSendAndErrors(t *testing.T) {
 		t.Errorf("expected not-modified error, got %v", err)
 	}
 }
+
+func TestRepoCallback(t *testing.T) {
+	kb := RepoKeyboard("HDBCD-2700", []string{"api", "a-very-long-repository-name-that-would-not-fit-in-callback-data"})
+	if len(kb) != 3 || kb[2][0].CallbackData != "back:HDBCD-2700" {
+		t.Fatalf("kb = %+v", kb)
+	}
+	cb, err := ParseCallback(kb[1][0].CallbackData)
+	if err != nil || cb.Action != ActRepo || cb.Key != "HDBCD-2700" || cb.RepoIndex != 1 {
+		t.Fatalf("cb = %+v %v", cb, err)
+	}
+	for _, bad := range []string{"repo:X-1", "repo:X-1:x", "repo:X-1:-1"} {
+		if _, err := ParseCallback(bad); err == nil {
+			t.Errorf("ParseCallback(%q) expected error", bad)
+		}
+	}
+}

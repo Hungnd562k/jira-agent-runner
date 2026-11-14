@@ -63,3 +63,35 @@ Priority: High · Status: Open
 - **M3** scheduler: poll, re-remind, snooze, closed-sync, graceful shutdown; define `Runner` interface.
 - **M4** Docker image + compose.
 - **Phase 2** worker: `approved` → clone/worktree (project→repo map) → `claude -p` → run tests, collect logs → push branch → GitLab draft MR → comment MR link on Jira + Telegram.
+
+## Phase 2 — agent jobs
+### Repo selection (notifier)
+`repos.json` (`REPOS_FILE`, see `repos.example.json`) maps a Jira project key to candidate repos `{name, gitlab_project, path, base_branch, test_cmd, allowed_tools}`. It is the one config kept outside env because it is a nested list; the file is git-ignored (host paths) and mounted read-only into the container. Missing file = no repos.
+
+`Fix it` by number of repos for the issue's project:
+- 0 → task `approved`, footer "no repo configured".
+- 1 → task `approved` + job `queued` (one transaction).
+- >1 → repo buttons `repo:<KEY>:<index>` + Back; nothing changes until a repo is picked.
+
+### Jobs
+Table `jobs` (migration 002): `queued → running → succeeded | failed`, with `branch`, `mr_url`, `error`, `tests_passed`. Approved notices show the latest job's progress (Queued / Agent running / Done + Draft MR + tests / Failed).
+
+### Worker (`runner --worker`, on the host)
+Runs where `claude` (logged in), git SSH credentials and repo toolchains exist; shares `./data/tasks.db` with the notifier container. Never calls `getUpdates` (only send/edit), so it does not conflict with the notifier's long polling. One job at a time; on start, jobs left `running` are marked `failed: interrupted`.
+
+Pipeline per job:
+1. `GetIssue` (summary, description, type, priority, components, labels, last 5 comments).
+2. `git fetch origin <base>` → `git worktree add -b agent/<KEY>-j<jobid> <dir> origin/<base>`, where `<dir>` defaults to `<parent of repo path>/.agent-<repo>-<KEY>-j<jobid>` (same depth as the clone, so relative references to sibling repos like `../../other-repo/x.csproj` resolve) or `<WORKTREE_DIR>/<KEY>-j<jobid>` when set. Git-ignored `CLAUDE.md`/`AGENTS.md`/`CLAUDE.local.md` are copied from the clone so the agent gets project guidance (never committed).
+3. `claude -p` (prompt on stdin) `--output-format json --permission-mode acceptEdits --allowedTools Read Edit Write Glob Grep Bash(git diff:*) Bash(git status:*) Bash(git log:*) <repo allowed_tools> --max-budget-usd <AGENT_MAX_BUDGET_USD> [--model]`, timeout `AGENT_TIMEOUT` (kills the process group). The agent must not commit/push. Raw output: `data/jobs/<id>/agent.json`.
+4. No changes → `failed: agent made no changes` (agent's explanation sent as a reply).
+5. The worker runs `test_cmd` itself (`sh -c`, timeout `TEST_TIMEOUT`) → `data/jobs/<id>/test.log`; failing tests do not abort.
+6. Commit `fix(<KEY>): <summary>` (+ Jira link, `Co-Authored-By: Claude`), host git identity.
+7. `--no-push`: stop here (branch kept locally). Otherwise `git push -u origin <branch>` and `POST /api/v4/projects/<path>/merge_requests` with title `Draft: [<KEY>] <summary>`, target `base_branch`, `remove_source_branch`, description = Jira link, test result (❌ = do not merge), agent report, diff stat, test log tail.
+8. Worktree removed (branch kept); job + notice updated (`Done … Draft MR · tests ✅/❌` or `Failed: …`).
+9. Report: `data/jobs/<id>/report.md` (always, once the agent ran) and a Telegram reply on success with repo, branch (+ `git -C <path> show <branch>` when not pushed) or Draft MR link, tests, cost, diff stat and the agent's report. When a Draft MR was opened, a Jira comment (wiki markup) with MR link, branch, tests and the agent report is added; the Jira status is never changed.
+
+If push or MR creation fails after the agent committed, the job is `failed` but the Telegram report still says where the branch is and which step failed. Recover without re-running the agent: `runner --worker --publish-job <id>` (push if needed, open the Draft MR, mark the job succeeded, report + Jira comment).
+
+Finished jobs (Done/Failed) show **🔁 Retry** (`rty:<KEY>`, same repo, new branch `-j<newid>`) and **📦 Other repo** (`orp:<KEY>` → repo buttons). Only one queued/running job per task.
+
+Worker env: `GITLAB_BASE_URL`, `GITLAB_TOKEN` (`api` scope; required unless `--no-push`), `WORKTREE_DIR` (empty = next to each clone), `CLAUDE_BIN` (`claude`), `AGENT_TIMEOUT` (`30m`), `AGENT_MAX_BUDGET_USD` (`5`), `AGENT_MODEL`, `TEST_TIMEOUT` (`15m`). Run with `make worker-local` (no push) / `make worker`, or the systemd user unit in `deploy/`.
