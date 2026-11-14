@@ -252,11 +252,22 @@ func TestWorktreeNextToRepoSeesSiblingsAndIgnoredGuidance(t *testing.T) {
 	}
 }
 
-type fakeComment struct{ key, body string }
+type fakeComment struct {
+	key, body   string
+	attachments []string
+}
 
 func (f *fakeComment) AddComment(_ context.Context, key, body string) error {
 	f.key, f.body = key, body
 	return nil
+}
+
+func (f *fakeComment) AddAttachment(_ context.Context, _, path, name string) (string, error) {
+	if _, err := os.Stat(path); err != nil {
+		return "", err
+	}
+	f.attachments = append(f.attachments, name)
+	return name, nil
 }
 
 func TestReportPublished(t *testing.T) {
@@ -331,5 +342,97 @@ func TestPublishAfterMRFailure(t *testing.T) {
 	}
 	if err := w.Publish(ctx, job.ID); err == nil {
 		t.Error("second publish should refuse (MR exists)")
+	}
+}
+
+// e2eClaude is a fake agent that checks the E2E contract (env, rules, deny rule, evidence dir
+// outside the worktree), then fixes the bug and leaves screenshots + e2e.json.
+const e2eClaude = `test "$E2E_BASE_URL" = "http://localhost:8803" || exit 11
+test "$E2E_PROFILE" = "local-maker" || exit 12
+test -n "$E2E_CREDENTIALS_FILE" || exit 13
+test -d "$EVIDENCE_DIR" || exit 14
+case "$EVIDENCE_DIR" in "$PWD"*) exit 15;; esac
+case "$*" in *"E2E web verification rules"*) ;; *) exit 16;; esac
+case "$*" in *"Read(/$E2E_CREDENTIALS_FILE)"*) ;; *) exit 17;; esac
+case "$*" in *"Bash(node:*)"*) ;; *) exit 18;; esac
+printf png > "$EVIDENCE_DIR/01-before.png"
+printf png > "$EVIDENCE_DIR/02-after.png"
+cat > "$EVIDENCE_DIR/e2e.json" <<'J'
+{"environment":"local BO","scenarios":[
+ {"id":"S1","name":"Save | trigger","expected":"no crash","result":"PASS","screenshots":["02-after.png"]}],"blocked":""}
+J
+` + okClaude
+
+func TestPipelineE2EEvidence(t *testing.T) {
+	ctx := context.Background()
+	w, tg, _, _ := setup(t, e2eClaude)
+	w.Repos["X"][0].E2E = &repos.E2E{BaseURL: "http://localhost:8803", StartCmd: "dotnet run", CredentialsProfile: "local-maker"}
+	w.CredentialsFile = filepath.Join(t.TempDir(), "credentials.json")
+	os.WriteFile(w.CredentialsFile, []byte(`{"profiles":{}}`), 0o600)
+	mr := &fakeMR{}
+	w.MR = mr
+	jc := &fakeComment{}
+	w.Comment = jc
+
+	if _, err := w.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	job, _ := w.Store.LatestJob(ctx, "X-1")
+	if job.Status != store.JobSucceeded {
+		t.Fatalf("job = %+v", job)
+	}
+	if len(tg.sends) != 1 || !strings.Contains(tg.sends[0], "E2E: ✅ 1/1 PASS · 2 screenshots") {
+		t.Fatalf("telegram report = %v", tg.sends)
+	}
+	if !strings.Contains(mr.req.Description, "| S1 | Save \\| trigger |") || !strings.Contains(mr.req.Description, "Co-authored-by: Claude") {
+		t.Errorf("MR description = %q", mr.req.Description)
+	}
+	want := []string{"X-1-j1-01-before.png", "X-1-j1-02-after.png"}
+	if strings.Join(jc.attachments, ",") != strings.Join(want, ",") {
+		t.Fatalf("attachments = %v", jc.attachments)
+	}
+	for _, s := range []string{"!X-1-j1-02-after.png|thumbnail!", "Other screenshots: !X-1-j1-01-before.png|thumbnail!",
+		"Save ¦ trigger", "(/) PASS", "{{Co-authored-by: Claude Code <noreply@anthropic.com>}}"} {
+		if !strings.Contains(jc.body, s) {
+			t.Errorf("jira comment missing %q:\n%s", s, jc.body)
+		}
+	}
+}
+
+func TestPipelineE2EMissingEvidenceIsFlagged(t *testing.T) {
+	ctx := context.Background()
+	w, tg, _, _ := setup(t, okClaude) // agent fixes but never verifies in a browser
+	w.Repos["X"][0].E2E = &repos.E2E{BaseURL: "http://localhost:8803", CredentialsProfile: "p"}
+	w.CredentialsFile = filepath.Join(t.TempDir(), "missing.json")
+	w.NoPush = true
+
+	w.RunOnce(ctx)
+	if len(tg.sends) != 1 || !strings.Contains(tg.sends[0], "E2E: ⚠️ incomplete — agent wrote no e2e.json") {
+		t.Fatalf("report = %v", tg.sends)
+	}
+	md, _ := os.ReadFile(filepath.Join(w.JobsDir, "1", "report.md"))
+	if !strings.Contains(string(md), "## E2E") {
+		t.Errorf("report.md = %s", md)
+	}
+}
+
+func TestEvidenceLine(t *testing.T) {
+	dir := t.TempDir()
+	write := func(js string) *Evidence {
+		os.WriteFile(filepath.Join(dir, "e2e.json"), []byte(js), 0o644)
+		return loadEvidence(dir)
+	}
+	if l := write(`{"scenarios":[{"id":"S1","result":"PASS"}]}`).Line(); !strings.Contains(l, "no screenshots") {
+		t.Errorf("no shots: %s", l)
+	}
+	os.WriteFile(filepath.Join(dir, "01.png"), nil, 0o644)
+	if l := write(`{"scenarios":[{"id":"S1","result":"PASS"},{"id":"S2","result":"FAIL"}]}`).Line(); !strings.HasPrefix(l, "❌ 1/2 FAIL") {
+		t.Errorf("fail: %s", l)
+	}
+	if l := write(`{"scenarios":[],"blocked":"no credentials profile"}`).Line(); !strings.Contains(l, "BLOCKED") {
+		t.Errorf("blocked: %s", l)
+	}
+	if e := write(`{"scenarios":[{"id":"S1","result":"PASS"}]}`); !e.Complete() || !strings.HasPrefix(e.Line(), "✅") {
+		t.Errorf("complete: %s", e.Line())
 	}
 }

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -62,5 +64,33 @@ func TestAddComment(t *testing.T) {
 	}
 	if err := New(srv.URL, "bad").AddComment(context.Background(), "X-1", "x"); err == nil {
 		t.Error("expected error")
+	}
+}
+
+func TestAddAttachment(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/rest/api/2/issue/X-1/attachments" || r.Header.Get("X-Atlassian-Token") != "no-check" ||
+			r.Header.Get("Authorization") != "Bearer pat" {
+			http.Error(w, "bad", http.StatusBadRequest)
+			return
+		}
+		f, h, err := r.FormFile("file")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		defer f.Close()
+		fmt.Fprintf(w, `[{"filename":%q,"size":%d}]`, h.Filename, h.Size)
+	}))
+	defer srv.Close()
+	path := filepath.Join(t.TempDir(), "01-shot.png")
+	os.WriteFile(path, []byte("png"), 0o600)
+
+	got, err := New(srv.URL, "pat").AddAttachment(context.Background(), "X-1", path, "X-1-j2-01-shot.png")
+	if err != nil || got != "X-1-j2-01-shot.png" {
+		t.Fatalf("AddAttachment = %q %v", got, err)
+	}
+	if _, err := New(srv.URL, "bad").AddAttachment(context.Background(), "X-1", path, ""); err == nil {
+		t.Error("expected error on HTTP 400")
 	}
 }

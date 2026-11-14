@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -144,4 +147,54 @@ func (c *Client) AddComment(ctx context.Context, key, body string) error {
 		return fmt.Errorf("jira add comment %s: HTTP %d: %s", key, resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
 	return nil
+}
+
+// AddAttachment uploads a local file to an issue as name and returns the stored file name
+// (use it in wiki markup, e.g. !name|thumbnail!).
+func (c *Client) AddAttachment(ctx context.Context, key, path, name string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if name == "" {
+		name = filepath.Base(path)
+	}
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	part, err := mw.CreateFormFile("file", name)
+	if err != nil {
+		return "", err
+	}
+	if _, err := io.Copy(part, f); err != nil {
+		return "", err
+	}
+	if err := mw.Close(); err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.baseURL+"/rest/api/2/issue/"+url.PathEscape(key)+"/attachments", &body)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.pat)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("X-Atlassian-Token", "no-check")
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("jira add attachment: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", fmt.Errorf("jira add attachment %s: HTTP %d: %s", key, resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	var out []struct {
+		Filename string `json:"filename"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || len(out) == 0 {
+		return name, nil
+	}
+	return out[0].Filename, nil
 }

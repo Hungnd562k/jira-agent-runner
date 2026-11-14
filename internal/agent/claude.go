@@ -24,6 +24,11 @@ type ClaudeSpec struct {
 	Dir          string // working directory (the worktree)
 	Prompt       string
 	AllowedTools []string // appended to BaseTools
+	// Disallowed are deny rules, e.g. "Read(//abs/secret.json)" (deny wins over allow).
+	Disallowed   []string
+	SystemPrompt string   // appended to Claude Code's system prompt (the job rules)
+	AddDirs      []string // extra directories the agent may access (e.g. the evidence dir)
+	Env          []string // extra KEY=VALUE environment for the agent and its tools
 	MaxBudgetUSD float64  // 0 = no limit flag
 	Model        string   // optional
 	Timeout      time.Duration
@@ -44,6 +49,17 @@ func (s ClaudeSpec) Args() []string {
 	args := []string{"-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--allowedTools"}
 	args = append(args, BaseTools...)
 	args = append(args, s.AllowedTools...)
+	if len(s.Disallowed) > 0 {
+		args = append(args, "--disallowedTools")
+		args = append(args, s.Disallowed...)
+	}
+	if len(s.AddDirs) > 0 {
+		args = append(args, "--add-dir")
+		args = append(args, s.AddDirs...)
+	}
+	if s.SystemPrompt != "" {
+		args = append(args, "--append-system-prompt", s.SystemPrompt)
+	}
 	if s.MaxBudgetUSD > 0 {
 		args = append(args, "--max-budget-usd", strconv.FormatFloat(s.MaxBudgetUSD, 'f', 2, 64))
 	}
@@ -68,6 +84,9 @@ func RunClaude(ctx context.Context, spec ClaudeSpec) (ClaudeResult, error) {
 	cmd := exec.CommandContext(ctx, bin, spec.Args()...)
 	cmd.Dir = spec.Dir
 	cmd.Stdin = strings.NewReader(spec.Prompt)
+	if len(spec.Env) > 0 {
+		cmd.Env = append(os.Environ(), spec.Env...)
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = 10 * time.Second
@@ -75,6 +94,11 @@ func RunClaude(ctx context.Context, spec ClaudeSpec) (ClaudeResult, error) {
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	runErr := cmd.Run()
+	// Reap anything the agent left running in its group (e.g. a local app server started for E2E),
+	// so the next job finds the port free.
+	if cmd.Process != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 
 	if spec.LogPath != "" {
 		_ = os.WriteFile(spec.LogPath, append(stdout.Bytes(), append([]byte("\n--- stderr ---\n"), stderr.Bytes()...)...), 0o644)

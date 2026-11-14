@@ -28,6 +28,9 @@ go.work.sum
 # env file
 .env
 
+# Web login credentials for E2E (see credentials.example.json)
+/.secrets/
+
 # Editor/IDE
 # .idea/
 # .vscode/

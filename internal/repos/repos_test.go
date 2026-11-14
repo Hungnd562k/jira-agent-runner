@@ -75,3 +75,19 @@ func TestNormalizeProject(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadE2E(t *testing.T) {
+	c, err := Load(write(t, `{"P":[{"name":"web","gitlab_project":"g/web","path":"/x","base_branch":"dev",
+		"e2e":{"base_url":"http://localhost:8803","start_cmd":"dotnet run","credentials_profile":"local-maker"}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := c["P"][0].E2E; e == nil || e.BaseURL != "http://localhost:8803" || e.CredentialsProfile != "local-maker" {
+		t.Fatalf("e2e = %+v", c["P"][0].E2E)
+	}
+	_, err = Load(write(t, `{"P":[{"name":"web","gitlab_project":"g/web","path":"/x","base_branch":"dev",
+		"e2e":{"base_url":"localhost:8803"}}]}`))
+	if err == nil || !strings.Contains(err.Error(), "e2e.base_url") || !strings.Contains(err.Error(), "e2e.credentials_profile") {
+		t.Fatalf("expected e2e validation errors, got %v", err)
+	}
+}

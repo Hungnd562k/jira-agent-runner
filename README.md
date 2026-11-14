@@ -26,6 +26,7 @@ Behavior and configuration: [docs/SPEC.md](docs/SPEC.md).
 1. `cp repos.example.json repos.json` and list, per Jira project, the candidate repos: local clone `path` (absolute), `gitlab_project`, `base_branch`, `test_cmd` (must work from the repo root), extra `allowed_tools` for build/test commands.
 2. Add `GITLAB_BASE_URL` / `GITLAB_TOKEN` (`api` scope) to `.env`.
 3. `make up` (notifier, reloads `repos.json`) and on the host `make worker-local` (local branch only) or `make worker` (push + Draft MR + Jira comment). For a permanent setup use `deploy/jira-agent-worker.service`.
-4. On Telegram: **Fix it** → pick repo → the notice shows progress; a report reply gives branch/MR, tests and the agent's root-cause summary. Finished jobs offer **Retry** / **Other repo**. Full report: `data/jobs/<id>/report.md`.
+4. Web repos: add an `e2e` block to the repo in `repos.json` and put web logins in `.secrets/credentials.json` (`chmod 600`, format: `credentials.example.json`), or point `E2E_CREDENTIALS_FILE` to an existing file with the same `profiles` format. Set `E2E_NODE_PATH` to a `node_modules` that has `playwright`. The agent then verifies the fix in a local browser; screenshots are attached to the Jira comment.
+5. On Telegram: **Fix it** → pick repo → the notice shows progress; a report reply gives branch/MR, tests and the agent's root-cause summary. Finished jobs offer **Retry** / **Other repo**. Full report: `data/jobs/<id>/report.md`.
 
 Worktrees are created next to each clone (`<parent>/.agent-<repo>-<KEY>-j<id>`) so relative references to sibling repos build; they are removed after each job.

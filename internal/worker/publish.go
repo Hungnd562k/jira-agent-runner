@@ -56,6 +56,10 @@ func (w *Worker) Publish(ctx context.Context, jobID int64) error {
 		}
 	}
 
+	if repo.E2E != nil {
+		rep.Evidence = loadEvidence(filepath.Join(jobDir, "evidence"))
+	}
+
 	g := agent.Git{Dir: repo.Path}
 	if _, err := g.Run(ctx, "rev-parse", "--verify", "--quiet", "refs/heads/"+job.Branch); err != nil {
 		return fmt.Errorf("local branch %s not found in %s", job.Branch, repo.Path)
@@ -68,7 +72,7 @@ func (w *Worker) Publish(ctx context.Context, jobID int64) error {
 		Repo:         repo,
 		SourceBranch: job.Branch,
 		Title:        fmt.Sprintf("Draft: [%s] %s", issue.Key, issue.Summary),
-		Description:  mrDescription(issue, repo, rep.Agent, rep.Tests, rep.DiffStat),
+		Description:  mrDescription(issue, repo, rep.Agent, rep.Tests, rep.Evidence, rep.DiffStat),
 	})
 	if err != nil {
 		return fmt.Errorf("open MR: %w", err)

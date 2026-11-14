@@ -6,15 +6,28 @@
       "path": "/home/you/work/cd-api",
       "base_branch": "develop",
       "test_cmd": "dotnet test",
-      "allowed_tools": ["Bash(dotnet build:*)", "Bash(dotnet test:*)"]
+      "allowed_tools": [
+        "Bash(dotnet build:*)",
+        "Bash(dotnet test:*)"
+      ]
     },
     {
       "name": "cd-web",
       "gitlab_project": "group/cd-web",
       "path": "/home/you/work/cd-web",
       "base_branch": "develop",
-      "test_cmd": "npm test -- --watch=false",
-      "allowed_tools": ["Bash(npm test:*)", "Bash(npm run lint:*)"]
+      "test_cmd": "dotnet test CoreServices.Tests/CoreServices.Tests.csproj",
+      "allowed_tools": [
+        "Bash(dotnet build:*)",
+        "Bash(dotnet test:*)",
+        "Bash(dotnet run:*)"
+      ],
+      "e2e": {
+        "base_url": "http://localhost:8803",
+        "start_cmd": "dotnet run --project DsbSuiteWeb/DsbSuiteWeb.csproj --launch-profile http",
+        "credentials_profile": "local-bo-maker",
+        "notes": "Login page /login: pick the profile role in the combobox, then Tài khoản / Mật khẩu, button Đăng nhập. Backend Host must already run on :8801."
+      }
     }
   ]
 }
