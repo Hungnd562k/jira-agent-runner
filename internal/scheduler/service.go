@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Hungnd562k/jira-agent-runner/internal/repos"
 	"github.com/Hungnd562k/jira-agent-runner/internal/store"
 	"github.com/Hungnd562k/jira-agent-runner/internal/telegram"
 )
@@ -27,6 +28,7 @@ type Service struct {
 	TG            Messenger
 	ChatID        int64
 	SnoozeChoices []time.Duration
+	Repos         repos.Config // candidate repos per Jira project for "Fix it"
 	PollInterval  time.Duration
 	RemindAfter   time.Duration // re-remind notified tasks untouched this long
 	RemindCheck   time.Duration // how often due reminders are checked (default 1m)
@@ -172,7 +174,7 @@ func (s *Service) send(ctx context.Context, t store.Task, footer string, replyTo
 
 // refresh re-renders messageID to reflect t's current state.
 func (s *Service) refresh(ctx context.Context, t store.Task, messageID int64) {
-	text, kb := s.view(t)
+	text, kb := s.render(ctx, t)
 	if err := s.TG.EditMessage(ctx, s.ChatID, messageID, text, kb); err != nil && !telegram.IsNotModified(err) {
 		s.Log.Warn("edit message", "key", t.JiraKey, "msg", messageID, "err", err)
 	}
@@ -257,14 +259,48 @@ func (s *Service) handleCallback(ctx context.Context, q *telegram.CallbackQuery)
 	)
 	switch {
 	case cb.Action == telegram.ActFix:
-		t, err = s.Store.Approve(ctx, cb.Key, now)
-		toast = "✅ Approved"
+		candidates := s.Repos.For(cb.Key)
+		switch len(candidates) {
+		case 0:
+			t, err = s.Store.Approve(ctx, cb.Key, now)
+			toast = "✅ Approved (no repo configured)"
+		case 1:
+			t, _, err = s.Store.ApproveAndEnqueue(ctx, cb.Key, candidates[0].Name, now)
+			toast = "🕓 Queued on " + candidates[0].Name
+		default:
+			// Ask which repo first; nothing changes until a repo is picked.
+			if t, err = s.Store.Get(ctx, cb.Key); err == nil {
+				if !approvable(t.State) {
+					err = store.ErrInvalidTransition
+					break
+				}
+				names := make([]string, len(candidates))
+				for i, r := range candidates {
+					names[i] = r.Name
+				}
+				text, _ := s.view(t)
+				if err := s.TG.EditMessage(ctx, s.ChatID, msgID, text, telegram.RepoKeyboard(t.JiraKey, names)); err != nil && !telegram.IsNotModified(err) {
+					s.Log.Warn("edit message", "key", t.JiraKey, "err", err)
+				}
+				answer("Choose a repo")
+				return
+			}
+		}
+	case cb.Action == telegram.ActRepo:
+		candidates := s.Repos.For(cb.Key)
+		if cb.RepoIndex >= len(candidates) {
+			answer("Unknown repo — repos.json changed?")
+			return
+		}
+		repo := candidates[cb.RepoIndex].Name
+		t, _, err = s.Store.ApproveAndEnqueue(ctx, cb.Key, repo, now)
+		toast = "🕓 Queued on " + repo
 	case cb.Action == telegram.ActSnooze && cb.Snooze > 0:
 		t, err = s.Store.Snooze(ctx, cb.Key, now.Add(cb.Snooze), now)
 		toast = "⏰ Snoozed " + telegram.FormatDuration(cb.Snooze)
 	case cb.Action == telegram.ActSnoozeMenu, cb.Action == telegram.ActBack:
 		if t, err = s.Store.Get(ctx, cb.Key); err == nil {
-			text, kb := s.view(t)
+			text, kb := s.render(ctx, t)
 			if cb.Action == telegram.ActSnoozeMenu && (t.State == store.StateNotified || t.State == store.StateSnoozed) {
 				kb = telegram.SnoozeKeyboard(t.JiraKey, s.SnoozeChoices)
 			}
@@ -315,4 +351,9 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	case <-ctx.Done():
 		return false
 	}
+}
+
+// approvable reports whether a task in state st can still be approved.
+func approvable(st store.State) bool {
+	return st == store.StateNew || st == store.StateNotified || st == store.StateSnoozed
 }

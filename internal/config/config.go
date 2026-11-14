@@ -26,7 +26,8 @@ type Config struct {
 	RemindInterval time.Duration
 	SnoozeChoices  []time.Duration
 
-	DBPath string
+	DBPath    string
+	ReposFile string
 }
 
 // Load reads configuration from the environment and validates it.
@@ -38,6 +39,7 @@ func Load(requireTelegram bool) (*Config, error) {
 		JiraJQL:          getenv("JIRA_JQL", defaultJQL),
 		TelegramBotToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
 		DBPath:           getenv("DB_PATH", "./data/tasks.db"),
+		ReposFile:        getenv("REPOS_FILE", "./repos.json"),
 	}
 
 	var errs []error

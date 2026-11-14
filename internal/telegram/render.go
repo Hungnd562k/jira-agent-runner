@@ -3,6 +3,7 @@ package telegram
 import (
 	"fmt"
 	"html"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -13,13 +14,15 @@ const (
 	ActSnoozeMenu = "snz"  // snz:<KEY>            → show duration choices
 	ActSnooze     = "snz"  // snz:<KEY>:<duration> → snooze
 	ActBack       = "back" // back:<KEY>           → main keyboard
+	ActRepo       = "repo" // repo:<KEY>:<index>   → approve + queue agent on that repo
 )
 
 // Callback is a parsed callback_data.
 type Callback struct {
-	Action string
-	Key    string
-	Snooze time.Duration // set only for snz:<KEY>:<d>
+	Action    string
+	Key       string
+	Snooze    time.Duration // set only for snz:<KEY>:<d>
+	RepoIndex int           // set only for repo:<KEY>:<i>
 }
 
 // ParseCallback decodes callback_data produced by this package.
@@ -40,6 +43,13 @@ func ParseCallback(data string) (Callback, error) {
 		}
 		cb.Snooze = d
 		return cb, nil
+	case cb.Action == ActRepo && len(parts) == 3:
+		i, err := strconv.Atoi(parts[2])
+		if err != nil || i < 0 {
+			return Callback{}, fmt.Errorf("bad repo index in %q", data)
+		}
+		cb.RepoIndex = i
+		return cb, nil
 	}
 	return Callback{}, fmt.Errorf("unknown callback %q", data)
 }
@@ -59,6 +69,44 @@ func SnoozeKeyboard(key string, choices []time.Duration) Keyboard {
 		row = append(row, InlineButton{Text: FormatDuration(d), CallbackData: ActSnooze + ":" + key + ":" + d.String()})
 	}
 	return Keyboard{row, {{Text: "« Back", CallbackData: ActBack + ":" + key}}}
+}
+
+// RepoKeyboard lets the user pick which repo the agent should work on (index-based
+// callback data keeps it under 64 bytes regardless of repo name length).
+func RepoKeyboard(key string, names []string) Keyboard {
+	kb := make(Keyboard, 0, len(names)+1)
+	for i, n := range names {
+		kb = append(kb, []InlineButton{{Text: "📦 " + n, CallbackData: fmt.Sprintf("%s:%s:%d", ActRepo, key, i)}})
+	}
+	return append(kb, []InlineButton{{Text: "« Back", CallbackData: ActBack + ":" + key}})
+}
+
+// Job footers: progress of the agent run on an approved task.
+func FooterNoRepo() string {
+	return "✅ <b>Approved</b> — ⚠️ no repo configured for this project (repos.json)"
+}
+func FooterQueued(repo string) string {
+	return "🕓 <b>Queued</b> — agent will work on <code>" + html.EscapeString(repo) + "</code>"
+}
+func FooterRunning(repo string) string {
+	return "🤖 <b>Agent running</b> on <code>" + html.EscapeString(repo) + "</code>…"
+}
+func FooterFailed(repo, reason string) string {
+	return "❌ <b>Agent failed</b> on <code>" + html.EscapeString(repo) + "</code>: " + html.EscapeString(reason)
+}
+func FooterDone(repo, mrURL, branch string, testsPassed *bool) string {
+	tests := "tests not run"
+	if testsPassed != nil {
+		tests = "tests ✅"
+		if !*testsPassed {
+			tests = "tests ❌"
+		}
+	}
+	target := "branch <code>" + html.EscapeString(branch) + "</code> (not pushed)"
+	if mrURL != "" {
+		target = `<a href="` + html.EscapeString(mrURL) + `">Draft MR</a>`
+	}
+	return "✅ <b>Done</b> on <code>" + html.EscapeString(repo) + "</code>: " + target + " · " + tests
 }
 
 // Notice is what a task message displays.

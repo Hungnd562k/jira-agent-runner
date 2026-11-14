@@ -17,6 +17,7 @@ import (
 
 	"github.com/Hungnd562k/jira-agent-runner/internal/config"
 	"github.com/Hungnd562k/jira-agent-runner/internal/jira"
+	"github.com/Hungnd562k/jira-agent-runner/internal/repos"
 	"github.com/Hungnd562k/jira-agent-runner/internal/scheduler"
 	"github.com/Hungnd562k/jira-agent-runner/internal/store"
 	"github.com/Hungnd562k/jira-agent-runner/internal/telegram"
@@ -81,12 +82,19 @@ func run(log *slog.Logger, once, dryRun bool) error {
 		return nil
 	}
 
+	repoCfg, err := repos.Load(cfg.ReposFile)
+	if err != nil {
+		return fmt.Errorf("load repos: %w", err)
+	}
+	log.Info("repos loaded", "file", cfg.ReposFile, "projects", len(repoCfg))
+
 	svc := &scheduler.Service{
 		Syncer:        syncer,
 		Store:         st,
 		TG:            telegram.New(telegramAPI, cfg.TelegramBotToken),
 		ChatID:        cfg.TelegramChatID,
 		SnoozeChoices: cfg.SnoozeChoices,
+		Repos:         repoCfg,
 		PollInterval:  cfg.PollInterval,
 		RemindAfter:   cfg.RemindInterval,
 		RemindCheck:   time.Minute,

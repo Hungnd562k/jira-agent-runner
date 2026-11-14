@@ -36,3 +36,6 @@ go.work.sum
 /data/
 /bin/
 .gitnexus/
+
+# Local repo mapping (host paths); see repos.example.json
+/repos.json

@@ -63,3 +63,15 @@ Priority: High · Status: Open
 - **M3** scheduler: poll, re-remind, snooze, closed-sync, graceful shutdown; define `Runner` interface.
 - **M4** Docker image + compose.
 - **Phase 2** worker: `approved` → clone/worktree (project→repo map) → `claude -p` → run tests, collect logs → push branch → GitLab draft MR → comment MR link on Jira + Telegram.
+
+## Phase 2 — agent jobs
+### Repo selection (notifier)
+`repos.json` (`REPOS_FILE`, see `repos.example.json`) maps a Jira project key to candidate repos `{name, gitlab_project, path, base_branch, test_cmd, allowed_tools}`. It is the one config kept outside env because it is a nested list; the file is git-ignored (host paths) and mounted read-only into the container. Missing file = no repos.
+
+`Fix it` by number of repos for the issue's project:
+- 0 → task `approved`, footer "no repo configured".
+- 1 → task `approved` + job `queued` (one transaction).
+- >1 → repo buttons `repo:<KEY>:<index>` + Back; nothing changes until a repo is picked.
+
+### Jobs
+Table `jobs` (migration 002): `queued → running → succeeded | failed`, with `branch`, `mr_url`, `error`, `tests_passed`. Approved notices show the latest job's progress (Queued / Agent running / Done + Draft MR + tests / Failed).

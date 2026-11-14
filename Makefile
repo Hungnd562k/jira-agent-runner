@@ -30,7 +30,7 @@ index:
 
 # Docker (see docker-compose.yml). Stop any local `make run` first: one bot token = one poller.
 .PHONY: up down logs
-up:
+up: repos.json
 	docker compose up -d --build
 
 down:
@@ -38,3 +38,7 @@ down:
 
 logs:
 	docker compose logs -f --no-log-prefix
+
+# Bind mount needs the file to exist; start with no repos (Fix it just approves).
+repos.json:
+	echo '{}' > repos.json

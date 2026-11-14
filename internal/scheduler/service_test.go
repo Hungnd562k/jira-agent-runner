@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Hungnd562k/jira-agent-runner/internal/jira"
+	"github.com/Hungnd562k/jira-agent-runner/internal/repos"
 	"github.com/Hungnd562k/jira-agent-runner/internal/store"
 	"github.com/Hungnd562k/jira-agent-runner/internal/telegram"
 )
@@ -232,5 +233,64 @@ func TestApprovedNeverReminded(t *testing.T) {
 	s.Remind(ctx)
 	if len(tg.sent) != 1 {
 		t.Fatalf("approved task reminded: %d sends", len(tg.sent))
+	}
+}
+
+func TestFixItSingleRepoQueues(t *testing.T) {
+	ctx := context.Background()
+	s, _, tg := newService(t, jira.Issue{Key: "A-1", Summary: "bug", URL: "u"})
+	s.Repos = repos.Config{"A": {{Name: "api"}}}
+	s.Cycle(ctx)
+
+	press(s, chatID, 1, "fix:A-1")
+	job, err := s.Store.LatestJob(ctx, "A-1")
+	if err != nil || job.Status != store.JobQueued || job.RepoName != "api" {
+		t.Fatalf("job = %+v %v", job, err)
+	}
+	last := tg.edits[len(tg.edits)-1]
+	if !strings.Contains(last.text, "Queued") || len(last.kb) != 0 {
+		t.Fatalf("edit = %+v", last)
+	}
+	if got := tg.answers[len(tg.answers)-1]; got != "🕓 Queued on api" {
+		t.Errorf("toast = %q", got)
+	}
+}
+
+func TestFixItMultiRepoAsksThenQueues(t *testing.T) {
+	ctx := context.Background()
+	s, _, tg := newService(t, jira.Issue{Key: "A-1", Summary: "bug", URL: "u"})
+	s.Repos = repos.Config{"A": {{Name: "api"}, {Name: "web"}}}
+	s.Cycle(ctx)
+
+	press(s, chatID, 1, "fix:A-1")
+	if task, _ := s.Store.Get(ctx, "A-1"); task.State != store.StateNotified {
+		t.Fatalf("state changed before repo chosen: %s", task.State)
+	}
+	kb := tg.edits[len(tg.edits)-1].kb
+	if len(kb) != 3 || kb[1][0].CallbackData != "repo:A-1:1" {
+		t.Fatalf("repo keyboard = %+v", kb)
+	}
+
+	press(s, chatID, 1, "back:A-1") // back restores main keyboard
+	if kb := tg.edits[len(tg.edits)-1].kb; len(kb) != 1 || len(kb[0]) != 2 {
+		t.Fatalf("back keyboard = %+v", kb)
+	}
+
+	press(s, chatID, 1, "repo:A-1:1")
+	job, err := s.Store.LatestJob(ctx, "A-1")
+	if err != nil || job.RepoName != "web" {
+		t.Fatalf("job = %+v %v", job, err)
+	}
+	if !strings.Contains(tg.edits[len(tg.edits)-1].text, "web") {
+		t.Errorf("footer should name repo: %q", tg.edits[len(tg.edits)-1].text)
+	}
+
+	press(s, chatID, 1, "repo:A-1:0") // stale button after approval
+	if n, _ := s.Store.LatestJob(ctx, "A-1"); n.ID != job.ID {
+		t.Fatal("second job enqueued from stale button")
+	}
+	press(s, chatID, 1, "repo:A-1:9")
+	if got := tg.answers[len(tg.answers)-1]; !strings.Contains(got, "Unknown repo") {
+		t.Errorf("out of range toast = %q", got)
 	}
 }
