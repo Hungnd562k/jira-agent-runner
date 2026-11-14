@@ -20,7 +20,10 @@ type Report struct {
 	DiffStat               string
 	Tests                  *agent.TestRun
 	Agent                  agent.ClaudeResult
+	Evidence               *Evidence // nil when the repo has no e2e config
 	MRURL                  string
+	Merged                 bool   // merged into base_branch, waiting for handover
+	MergeNote              string // why the MR was not auto-merged (or the merge error)
 }
 
 func (r *Report) ready() bool { return r.Branch != "" && r.Agent.Text != "" }
@@ -40,13 +43,20 @@ func (r *Report) testsLine() string {
 func (r *Report) Telegram() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "📋 <b>%s</b> · <code>%s</code>\n", html.EscapeString(r.Key), html.EscapeString(r.Repo.Name))
-	if r.MRURL != "" {
-		fmt.Fprintf(&b, "🔀 <a href=\"%s\">Draft MR</a> · branch <code>%s</code>\n", html.EscapeString(r.MRURL), html.EscapeString(r.Branch))
-	} else {
+	switch {
+	case r.Merged:
+		fmt.Fprintf(&b, "🔀 <a href=\"%s\">MR</a> đã merge vào <code>%s</code> — chờ bàn giao\n", html.EscapeString(r.MRURL), html.EscapeString(r.Repo.BaseBranch))
+	case r.MRURL != "":
+		fmt.Fprintf(&b, "📝 <a href=\"%s\">MR</a> chưa merge (%s) · branch <code>%s</code>\n", html.EscapeString(r.MRURL),
+			html.EscapeString(truncate(r.MergeNote, 200)), html.EscapeString(r.Branch))
+	default:
 		fmt.Fprintf(&b, "🌿 Local branch <code>%s</code> (not pushed)\n👀 <code>git -C %s show %s</code>\n",
 			html.EscapeString(r.Branch), html.EscapeString(r.Repo.Path), html.EscapeString(r.Branch))
 	}
 	fmt.Fprintf(&b, "🧪 Tests: %s\n", html.EscapeString(r.testsLine()))
+	if r.Evidence != nil {
+		fmt.Fprintf(&b, "🖥 E2E: %s\n", html.EscapeString(r.Evidence.Line()))
+	}
 	fmt.Fprintf(&b, "💰 $%.2f · %d turns · logs <code>%s</code>\n", r.Agent.CostUSD, r.Agent.NumTurns, html.EscapeString(r.JobDir))
 	if r.DiffStat != "" {
 		b.WriteString("\n<pre>" + html.EscapeString(truncate(r.DiffStat, 600)) + "</pre>\n")
@@ -65,11 +75,19 @@ func (r *Report) Markdown(j store.Job) string {
 	fmt.Fprintf(&b, "# %s — %s\n\n", r.Key, r.Summary)
 	fmt.Fprintf(&b, "- Jira: %s\n- Repo: %s (`%s`)\n- Branch: `%s`\n", r.IssueURL, r.Repo.Name, r.Repo.Path, r.Branch)
 	if r.MRURL != "" {
-		fmt.Fprintf(&b, "- Draft MR: %s\n", r.MRURL)
+		fmt.Fprintf(&b, "- MR: %s\n", r.MRURL)
+	}
+	if r.Merged {
+		fmt.Fprintf(&b, "- Merged into `%s`, waiting for handover\n", r.Repo.BaseBranch)
+	} else if r.MergeNote != "" {
+		fmt.Fprintf(&b, "- Not merged: %s\n", r.MergeNote)
 	}
 	fmt.Fprintf(&b, "- Job: #%d %s\n- Tests: %s\n- Agent: $%.2f, %d turns\n\n", j.ID, j.Status, r.testsLine(), r.Agent.CostUSD, r.Agent.NumTurns)
 	if r.DiffStat != "" {
 		b.WriteString("## Diff stat\n\n```\n" + r.DiffStat + "\n```\n\n")
+	}
+	if r.Evidence != nil {
+		b.WriteString("## E2E\n\n" + r.Evidence.Markdown() + "Evidence: `" + r.Evidence.Dir + "`\n\n")
 	}
 	b.WriteString("## Agent report\n\n" + strings.TrimSpace(r.Agent.Text) + "\n")
 	if r.Tests != nil {
@@ -81,11 +99,24 @@ func (r *Report) Markdown(j store.Job) string {
 // JiraComment renders the comment posted on the issue (Jira Server wiki markup).
 func (r *Report) JiraComment() string {
 	var b strings.Builder
-	b.WriteString("(*) *jira-agent-runner*: an AI agent (Claude Code) prepared a fix for review.\n\n")
-	fmt.Fprintf(&b, "* Draft MR: %s\n* Repo: %s, branch {{%s}}\n", r.MRURL, r.Repo.Name, r.Branch)
+	if r.Merged {
+		fmt.Fprintf(&b, "(*) *jira-agent-runner*: AI agent (Claude Code) đã sửa lỗi, test và merge vào {{%s}}. Trạng thái: *chờ bàn giao*.\n\n", r.Repo.BaseBranch)
+	} else {
+		b.WriteString("(*) *jira-agent-runner*: AI agent (Claude Code) đã chuẩn bị bản sửa, cần review MR.\n\n")
+	}
+	fmt.Fprintf(&b, "* MR: %s\n* Repo: %s, branch {{%s}}\n", r.MRURL, r.Repo.Name, r.Branch)
+	if !r.Merged && r.MergeNote != "" {
+		fmt.Fprintf(&b, "* Chưa merge: %s\n", wikiCell(r.MergeNote))
+	}
 	tests := strings.NewReplacer("✅", "(/)", "❌", "(x)", "`", "").Replace(r.testsLine())
 	fmt.Fprintf(&b, "* Tests: %s\n\n", tests)
+	if r.Evidence != nil {
+		b.WriteString(r.Evidence.JiraWiki() + "\n")
+	}
 	b.WriteString("{noformat}\n" + truncate(strings.TrimSpace(r.Agent.Text), 6000) + "\n{noformat}\n")
-	b.WriteString("_Not merged — a human must review the MR._")
+	if !r.Merged {
+		b.WriteString("_Chưa merge — cần người review MR._\n\n")
+	}
+	b.WriteString("{{" + coAuthor + "}}")
 	return b.String()
 }

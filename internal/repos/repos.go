@@ -19,6 +19,20 @@ type Repo struct {
 	BaseBranch    string   `json:"base_branch"`    // branch to fork from and target of the MR
 	TestCmd       string   `json:"test_cmd"`       // shell command run in the worktree for test evidence
 	AllowedTools  []string `json:"allowed_tools"`  // extra Claude Code tool permissions, e.g. "Bash(dotnet test:*)"
+	E2E           *E2E     `json:"e2e,omitempty"`  // set = the agent must verify the fix in a browser
+	// AutoMerge merges the agent's MR into base_branch when tests pass and E2E (if configured) is ✅.
+	AutoMerge bool `json:"auto_merge"`
+	// HandoverBranch is the deploy branch (e.g. "test"): merged fixes are handed over by a
+	// base_branch → HandoverBranch MR after the user confirms on Telegram. Empty = no handover.
+	HandoverBranch string `json:"handover_branch"`
+}
+
+// E2E configures local browser verification for a web repo.
+type E2E struct {
+	BaseURL            string `json:"base_url"`            // e.g. http://localhost:8803
+	StartCmd           string `json:"start_cmd"`           // run from the repo root; empty = app already running
+	CredentialsProfile string `json:"credentials_profile"` // profile in E2E_CREDENTIALS_FILE
+	Notes              string `json:"notes"`               // hints for the agent: login flow, menus, test data
 }
 
 // Config maps a Jira project key (e.g. "HDBCD") to its candidate repos.
@@ -92,6 +106,17 @@ func (c Config) validate() error {
 			}
 			if r.BaseBranch == "" {
 				errs = append(errs, fmt.Errorf("%s: base_branch is required", where))
+			}
+			if r.HandoverBranch != "" && r.HandoverBranch == r.BaseBranch {
+				errs = append(errs, fmt.Errorf("%s: handover_branch must differ from base_branch", where))
+			}
+			if e := r.E2E; e != nil {
+				if !strings.HasPrefix(e.BaseURL, "http://") && !strings.HasPrefix(e.BaseURL, "https://") {
+					errs = append(errs, fmt.Errorf("%s: e2e.base_url must be an http(s) URL", where))
+				}
+				if e.CredentialsProfile == "" {
+					errs = append(errs, fmt.Errorf("%s: e2e.credentials_profile is required", where))
+				}
 			}
 		}
 	}

@@ -56,6 +56,10 @@ func (w *Worker) Publish(ctx context.Context, jobID int64) error {
 		}
 	}
 
+	if repo.E2E != nil {
+		rep.Evidence = loadEvidence(filepath.Join(jobDir, "evidence"))
+	}
+
 	g := agent.Git{Dir: repo.Path}
 	if _, err := g.Run(ctx, "rev-parse", "--verify", "--quiet", "refs/heads/"+job.Branch); err != nil {
 		return fmt.Errorf("local branch %s not found in %s", job.Branch, repo.Path)
@@ -64,27 +68,19 @@ func (w *Worker) Publish(ctx context.Context, jobID int64) error {
 	if _, err := g.Run(ctx, "push", "origin", job.Branch); err != nil {
 		return fmt.Errorf("push: %w", err)
 	}
-	url, err := w.MR.OpenDraftMR(ctx, MRRequest{
-		Repo:         repo,
-		SourceBranch: job.Branch,
-		Title:        fmt.Sprintf("Draft: [%s] %s", issue.Key, issue.Summary),
-		Description:  mrDescription(issue, repo, rep.Agent, rep.Tests, rep.DiffStat),
-	})
-	if err != nil {
-		return fmt.Errorf("open MR: %w", err)
-	}
-	rep.MRURL = url
-
-	res := store.JobResult{Status: store.JobSucceeded, MRURL: url}
+	log := w.Log.With("job", job.ID, "key", job.JiraKey, "repo", job.RepoName)
+	res := store.JobResult{Status: store.JobSucceeded}
 	if rep.Tests != nil {
 		res.TestsPassed = &rep.Tests.Passed
+	}
+	if err := w.openAndMerge(ctx, log, issue, repo, job.Branch, rep, &res); err != nil {
+		return err
 	}
 	done, err := w.Store.FinishJob(ctx, job.ID, res, w.Now())
 	if err != nil {
 		return err
 	}
-	log := w.Log.With("job", job.ID, "key", job.JiraKey, "repo", job.RepoName)
-	log.Info("job published", "mr", url)
+	log.Info("job published", "mr", res.MRURL, "merged", res.MergedSHA != "")
 	w.updateNotice(ctx, done)
 	w.publish(ctx, log, done, rep)
 	return nil

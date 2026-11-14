@@ -96,18 +96,19 @@ func run(log *slog.Logger, once, dryRun bool) error {
 	log.Info("repos loaded", "file", cfg.ReposFile, "projects", len(repoCfg))
 
 	svc := &scheduler.Service{
-		Syncer:        syncer,
-		Store:         st,
-		TG:            telegram.New(telegramAPI, cfg.TelegramBotToken),
-		ChatID:        cfg.TelegramChatID,
-		SnoozeChoices: cfg.SnoozeChoices,
-		Repos:         repoCfg,
-		PollInterval:  cfg.PollInterval,
-		RemindAfter:   cfg.RemindInterval,
-		RemindCheck:   time.Minute,
-		SendGap:       time.Second,
-		Now:           time.Now,
-		Log:           log,
+		Syncer:          syncer,
+		Store:           st,
+		TG:              telegram.New(telegramAPI, cfg.TelegramBotToken),
+		ChatID:          cfg.TelegramChatID,
+		SnoozeChoices:   cfg.SnoozeChoices,
+		Repos:           repoCfg,
+		PollInterval:    cfg.PollInterval,
+		RemindAfter:     cfg.RemindInterval,
+		HandoverTimeout: cfg.PipelineTimeout,
+		RemindCheck:     time.Minute,
+		SendGap:         time.Second,
+		Now:             time.Now,
+		Log:             log,
 	}
 	hb := heartbeatPath()
 	svc.Heartbeat = func() {

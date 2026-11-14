@@ -28,6 +28,9 @@ type Config struct {
 
 	DBPath    string
 	ReposFile string
+
+	// PipelineTimeout bounds watching a handover's CI/CD (worker; notifier uses it for "watch again").
+	PipelineTimeout time.Duration
 }
 
 // Load reads configuration from the environment and validates it.
@@ -49,6 +52,9 @@ func Load(requireTelegram bool) (*Config, error) {
 		errs = append(errs, err)
 	}
 	if c.RemindInterval, err = durationEnv("REMIND_INTERVAL", "4h"); err != nil {
+		errs = append(errs, err)
+	}
+	if c.PipelineTimeout, err = durationEnv("PIPELINE_TIMEOUT", "90m"); err != nil {
 		errs = append(errs, err)
 	}
 	if c.SnoozeChoices, err = parseDurations(getenv("SNOOZE_CHOICES", "30m,2h,24h")); err != nil {

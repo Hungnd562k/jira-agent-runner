@@ -30,10 +30,18 @@ type Job struct {
 	CreatedAt   time.Time
 	StartedAt   time.Time
 	FinishedAt  time.Time
+	MRIID       int64
+	MergedSHA   string
+	MergedAt    time.Time // non-zero = merged into base_branch, waiting for handover
+	HandoverID  int64
+	DeliveredAt time.Time // non-zero = handover CI/CD succeeded
 }
 
-const selectJob = `SELECT id, jira_key, repo_name, status, branch, mr_url, error, tests_passed,
-	created_at, started_at, finished_at FROM jobs`
+// jobColumns is shared by every SELECT/RETURNING so scanJob always matches.
+const jobColumns = `id, jira_key, repo_name, status, branch, mr_url, error, tests_passed,
+	created_at, started_at, finished_at, mr_iid, merged_sha, merged_at, handover_id, delivered_at`
+
+const selectJob = `SELECT ` + jobColumns + ` FROM jobs`
 
 func scanJob(r scanner) (Job, error) {
 	var (
@@ -41,11 +49,16 @@ func scanJob(r scanner) (Job, error) {
 		passed            sql.NullInt64
 		created           int64
 		started, finished sql.NullInt64
+		merged, handover  sql.NullInt64
+		delivered         sql.NullInt64
 	)
 	if err := r.Scan(&j.ID, &j.JiraKey, &j.RepoName, &j.Status, &j.Branch, &j.MRURL, &j.Error, &passed,
-		&created, &started, &finished); err != nil {
+		&created, &started, &finished, &j.MRIID, &j.MergedSHA, &merged, &handover, &delivered); err != nil {
 		return Job{}, err
 	}
+	j.MergedAt = fromNull(merged)
+	j.HandoverID = handover.Int64
+	j.DeliveredAt = fromNull(delivered)
 	if passed.Valid {
 		p := passed.Int64 == 1
 		j.TestsPassed = &p
@@ -99,8 +112,7 @@ func (s *Store) GetJob(ctx context.Context, id int64) (Job, error) {
 func (s *Store) ClaimJob(ctx context.Context, now time.Time) (Job, bool, error) {
 	j, err := scanJob(s.db.QueryRowContext(ctx, `UPDATE jobs SET status = ?, started_at = ?
 		WHERE id = (SELECT id FROM jobs WHERE status = ? ORDER BY id LIMIT 1)
-		RETURNING id, jira_key, repo_name, status, branch, mr_url, error, tests_passed,
-		created_at, started_at, finished_at`, JobRunning, now.Unix(), JobQueued))
+		RETURNING `+jobColumns, JobRunning, now.Unix(), JobQueued))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Job{}, false, nil
 	}
@@ -113,8 +125,7 @@ func (s *Store) ClaimJob(ctx context.Context, now time.Time) (Job, bool, error) 
 // FailOrphaned marks jobs left running (e.g. worker crashed) as failed. Call at worker start.
 func (s *Store) FailOrphaned(ctx context.Context, now time.Time) ([]Job, error) {
 	rows, err := s.db.QueryContext(ctx, `UPDATE jobs SET status = ?, error = 'interrupted (worker restarted)', finished_at = ?
-		WHERE status = ? RETURNING id, jira_key, repo_name, status, branch, mr_url, error, tests_passed,
-		created_at, started_at, finished_at`, JobFailed, now.Unix(), JobRunning)
+		WHERE status = ? RETURNING `+jobColumns, JobFailed, now.Unix(), JobRunning)
 	if err != nil {
 		return nil, err
 	}
@@ -142,6 +153,8 @@ type JobResult struct {
 	MRURL       string
 	Error       string
 	TestsPassed *bool
+	MRIID       int64
+	MergedSHA   string // set = the MR was merged into base_branch (job waits for handover)
 }
 
 // FinishJob stores a job's outcome and logs an event on its task.
@@ -158,13 +171,21 @@ func (s *Store) FinishJob(ctx context.Context, id int64, r JobResult, now time.T
 		return Job{}, err
 	}
 	defer tx.Rollback()
-	j, err := scanJob(tx.QueryRowContext(ctx, `UPDATE jobs SET status = ?, mr_url = ?, error = ?, tests_passed = ?, finished_at = ?
-		WHERE id = ? RETURNING id, jira_key, repo_name, status, branch, mr_url, error, tests_passed,
-		created_at, started_at, finished_at`, r.Status, r.MRURL, r.Error, passed, now.Unix(), id))
+	var merged sql.NullInt64
+	if r.MergedSHA != "" {
+		merged = sql.NullInt64{Int64: now.Unix(), Valid: true}
+	}
+	j, err := scanJob(tx.QueryRowContext(ctx, `UPDATE jobs SET status = ?, mr_url = ?, error = ?, tests_passed = ?, finished_at = ?,
+		mr_iid = ?, merged_sha = ?, merged_at = ?
+		WHERE id = ? RETURNING `+jobColumns, r.Status, r.MRURL, r.Error, passed, now.Unix(),
+		r.MRIID, r.MergedSHA, merged, id))
 	if err != nil {
 		return Job{}, err
 	}
 	payload := r.MRURL
+	if r.MergedSHA != "" {
+		payload = "merged " + r.MergedSHA + " " + r.MRURL
+	}
 	if r.Status == JobFailed {
 		payload = r.Error
 	}
