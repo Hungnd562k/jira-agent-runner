@@ -88,5 +88,8 @@ Pipeline per job:
 6. Commit `fix(<KEY>): <summary>` (+ Jira link, `Co-Authored-By: Claude`), host git identity.
 7. `--no-push`: stop here (branch kept locally). Otherwise `git push -u origin <branch>` and `POST /api/v4/projects/<path>/merge_requests` with title `Draft: [<KEY>] <summary>`, target `base_branch`, `remove_source_branch`, description = Jira link, test result (❌ = do not merge), agent report, diff stat, test log tail.
 8. Worktree removed (branch kept); job + notice updated (`Done … Draft MR · tests ✅/❌` or `Failed: …`).
+9. Report: `data/jobs/<id>/report.md` (always, once the agent ran) and a Telegram reply on success with repo, branch (+ `git -C <path> show <branch>` when not pushed) or Draft MR link, tests, cost, diff stat and the agent's report. When a Draft MR was opened, a Jira comment (wiki markup) with MR link, branch, tests and the agent report is added; the Jira status is never changed.
+
+Finished jobs (Done/Failed) show **🔁 Retry** (`rty:<KEY>`, same repo, new branch `-j<newid>`) and **📦 Other repo** (`orp:<KEY>` → repo buttons). Only one queued/running job per task.
 
 Worker env: `GITLAB_BASE_URL`, `GITLAB_TOKEN` (`api` scope; required unless `--no-push`), `WORKTREE_DIR` (empty = next to each clone), `CLAUDE_BIN` (`claude`), `AGENT_TIMEOUT` (`30m`), `AGENT_MAX_BUDGET_USD` (`5`), `AGENT_MODEL`, `TEST_TIMEOUT` (`15m`). Run with `make worker-local` (no push) / `make worker`, or the systemd user unit in `deploy/`.

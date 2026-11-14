@@ -244,3 +244,45 @@ func TestWorktreeNextToRepoSeesSiblingsAndIgnoredGuidance(t *testing.T) {
 		t.Errorf("sibling worktree not removed: %v", err)
 	}
 }
+
+type fakeComment struct{ key, body string }
+
+func (f *fakeComment) AddComment(_ context.Context, key, body string) error {
+	f.key, f.body = key, body
+	return nil
+}
+
+func TestReportPublished(t *testing.T) {
+	ctx := context.Background()
+
+	// Local (no push): Telegram report tells where the branch is; no Jira comment.
+	w, tg, clone, _ := setup(t, okClaude)
+	w.NoPush = true
+	jc := &fakeComment{}
+	w.Comment = jc
+	w.RunOnce(ctx)
+	if len(tg.sends) != 1 || !strings.Contains(tg.sends[0], "git -C "+clone+" show agent/X-1-j1") ||
+		!strings.Contains(tg.sends[0], "Root cause") || !strings.Contains(tg.sends[0], "app.txt") {
+		t.Fatalf("local report = %v", tg.sends)
+	}
+	if jc.key != "" {
+		t.Errorf("Jira commented without an MR: %q", jc.body)
+	}
+	md, err := os.ReadFile(filepath.Join(w.JobsDir, "1", "report.md"))
+	if err != nil || !strings.Contains(string(md), "Branch: `agent/X-1-j1`") {
+		t.Fatalf("report.md = %q %v", md, err)
+	}
+
+	// Push: report links the MR and the Jira issue gets a comment.
+	w2, tg2, _, _ := setup(t, okClaude)
+	w2.MR = &fakeMR{}
+	jc2 := &fakeComment{}
+	w2.Comment = jc2
+	w2.RunOnce(ctx)
+	if len(tg2.sends) != 1 || !strings.Contains(tg2.sends[0], "https://gitlab/mr/1") {
+		t.Fatalf("push report = %v", tg2.sends)
+	}
+	if jc2.key != "X-1" || !strings.Contains(jc2.body, "https://gitlab/mr/1") || !strings.Contains(jc2.body, "(/)") {
+		t.Fatalf("jira comment = %+v", jc2)
+	}
+}

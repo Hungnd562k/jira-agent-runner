@@ -1,6 +1,7 @@
 package jira
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -117,4 +118,30 @@ func (c *Client) GetIssue(ctx context.Context, key string) (IssueDetail, error) 
 func parseTime(s string) time.Time {
 	t, _ := time.Parse(jiraTimeLayout, s)
 	return t
+}
+
+// AddComment posts a comment (Jira Server wiki markup) on an issue.
+func (c *Client) AddComment(ctx context.Context, key, body string) error {
+	payload, err := json.Marshal(map[string]string{"body": body})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.baseURL+"/rest/api/2/issue/"+url.PathEscape(key)+"/comment", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.pat)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("jira add comment: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("jira add comment %s: HTTP %d: %s", key, resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	return nil
 }

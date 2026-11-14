@@ -65,3 +65,29 @@ func TestJobLifecycle(t *testing.T) {
 		t.Fatalf("orphans = %+v %v", orphans, err)
 	}
 }
+
+func TestEnqueueRetry(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	now := time.Unix(1_800_000_000, 0)
+	s.Upsert(ctx, IssueInput{Key: "X-1", Summary: "s", URL: "u"}, now)
+	s.MarkNotified(ctx, "X-1", 1, now)
+
+	if _, err := s.Enqueue(ctx, "X-1", "api", now); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("enqueue before approval: %v", err)
+	}
+	_, first, _ := s.ApproveAndEnqueue(ctx, "X-1", "api", now)
+	if _, err := s.Enqueue(ctx, "X-1", "api", now); !errors.Is(err, ErrJobActive) {
+		t.Fatalf("enqueue while queued: %v", err)
+	}
+	s.ClaimJob(ctx, now)
+	s.FinishJob(ctx, first.ID, JobResult{Status: JobFailed, Error: "x"}, now)
+
+	j, err := s.Enqueue(ctx, "X-1", "web", now)
+	if err != nil || j.ID == first.ID || j.RepoName != "web" || j.Status != JobQueued {
+		t.Fatalf("retry = %+v %v", j, err)
+	}
+	if latest, _ := s.LatestJob(ctx, "X-1"); latest.ID != j.ID {
+		t.Fatalf("latest = %+v", latest)
+	}
+}

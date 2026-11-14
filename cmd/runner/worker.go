@@ -48,10 +48,11 @@ func runWorker(log *slog.Logger, once, noPush bool) error {
 	}
 	defer st.Close()
 
+	jc := jira.New(cfg.JiraBaseURL, cfg.JiraPAT)
 	w := &worker.Worker{
 		Store:  st,
 		Repos:  repoCfg,
-		Jira:   jira.New(cfg.JiraBaseURL, cfg.JiraPAT),
+		Jira:   jc,
 		TG:     telegram.New(telegramAPI, cfg.TelegramBotToken),
 		ChatID: cfg.TelegramChatID,
 		NoPush: noPush,
@@ -69,6 +70,7 @@ func runWorker(log *slog.Logger, once, noPush bool) error {
 	}
 	if !noPush {
 		w.MR = gitlab.New(wcfg.GitLabBaseURL, wcfg.GitLabToken)
+		w.Comment = jc // Jira comment only when a Draft MR is opened
 	}
 
 	log.Info("worker starting", "once", once, "no_push", noPush, "db", cfg.DBPath,

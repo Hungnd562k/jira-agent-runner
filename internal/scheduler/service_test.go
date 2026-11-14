@@ -294,3 +294,65 @@ func TestFixItMultiRepoAsksThenQueues(t *testing.T) {
 		t.Errorf("out of range toast = %q", got)
 	}
 }
+
+func TestRetryAndOtherRepo(t *testing.T) {
+	ctx := context.Background()
+	s, _, tg := newService(t, jira.Issue{Key: "A-1", Summary: "bug", URL: "u"})
+	s.Repos = repos.Config{"A": {{Name: "api"}, {Name: "web"}}}
+	s.Cycle(ctx)
+	press(s, chatID, 1, "repo:A-1:0")
+
+	press(s, chatID, 1, "rty:A-1") // still queued → refused
+	if got := tg.answers[len(tg.answers)-1]; got != "A job is already queued or running" {
+		t.Fatalf("retry while queued toast = %q", got)
+	}
+
+	first, _ := s.Store.LatestJob(ctx, "A-1")
+	s.Store.ClaimJob(ctx, s.Now())
+	s.Store.FinishJob(ctx, first.ID, store.JobResult{Status: store.JobFailed, Error: "boom"}, s.Now())
+
+	// A finished job's notice offers Retry / Other repo.
+	task, _ := s.Store.Get(ctx, "A-1")
+	_, kb := s.render(ctx, task)
+	if len(kb) != 1 || kb[0][0].CallbackData != "rty:A-1" || kb[0][1].CallbackData != "orp:A-1" {
+		t.Fatalf("finished-job keyboard = %+v", kb)
+	}
+
+	press(s, chatID, 1, "rty:A-1")
+	retry, _ := s.Store.LatestJob(ctx, "A-1")
+	if retry.ID == first.ID || retry.RepoName != "api" || retry.Status != store.JobQueued {
+		t.Fatalf("retry job = %+v", retry)
+	}
+	if got := tg.answers[len(tg.answers)-1]; got != "🔁 Retrying on api" {
+		t.Errorf("retry toast = %q", got)
+	}
+
+	s.Store.ClaimJob(ctx, s.Now())
+	s.Store.FinishJob(ctx, retry.ID, store.JobResult{Status: store.JobSucceeded}, s.Now())
+	press(s, chatID, 1, "orp:A-1")
+	if kb := tg.edits[len(tg.edits)-1].kb; len(kb) != 3 || kb[1][0].CallbackData != "repo:A-1:1" {
+		t.Fatalf("other-repo keyboard = %+v", kb)
+	}
+	press(s, chatID, 1, "repo:A-1:1")
+	other, _ := s.Store.LatestJob(ctx, "A-1")
+	if other.RepoName != "web" || other.Status != store.JobQueued {
+		t.Fatalf("other repo job = %+v", other)
+	}
+}
+
+func TestRefreshApprovedAddsJobButtons(t *testing.T) {
+	ctx := context.Background()
+	s, _, tg := newService(t, jira.Issue{Key: "A-1", Summary: "bug", URL: "u"})
+	s.Repos = repos.Config{"A": {{Name: "api"}}}
+	s.Cycle(ctx)
+	press(s, chatID, 1, "fix:A-1")
+	j, _ := s.Store.LatestJob(ctx, "A-1")
+	s.Store.ClaimJob(ctx, s.Now())
+	s.Store.FinishJob(ctx, j.ID, store.JobResult{Status: store.JobSucceeded}, s.Now()) // finished by the worker
+
+	s.RefreshApproved(ctx)
+	last := tg.edits[len(tg.edits)-1]
+	if last.msgID != 1 || len(last.kb) != 1 || last.kb[0][0].CallbackData != "rty:A-1" {
+		t.Fatalf("refresh edit = %+v", last)
+	}
+}

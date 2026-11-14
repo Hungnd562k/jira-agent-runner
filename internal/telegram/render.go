@@ -15,6 +15,8 @@ const (
 	ActSnooze     = "snz"  // snz:<KEY>:<duration> → snooze
 	ActBack       = "back" // back:<KEY>           → main keyboard
 	ActRepo       = "repo" // repo:<KEY>:<index>   → approve + queue agent on that repo
+	ActRetry      = "rty"  // rty:<KEY>            → re-run the agent on the last job's repo
+	ActOtherRepo  = "orp"  // orp:<KEY>            → pick another repo for a new job
 )
 
 // Callback is a parsed callback_data.
@@ -34,7 +36,8 @@ func ParseCallback(data string) (Callback, error) {
 	cb := Callback{Action: parts[0], Key: parts[1]}
 	switch {
 	case cb.Action == ActFix && len(parts) == 2, cb.Action == ActBack && len(parts) == 2,
-		cb.Action == ActSnoozeMenu && len(parts) == 2:
+		cb.Action == ActSnoozeMenu && len(parts) == 2,
+		cb.Action == ActRetry && len(parts) == 2, cb.Action == ActOtherRepo && len(parts) == 2:
 		return cb, nil
 	case cb.Action == ActSnooze && len(parts) == 3:
 		d, err := time.ParseDuration(parts[2])
@@ -79,6 +82,14 @@ func RepoKeyboard(key string, names []string) Keyboard {
 		kb = append(kb, []InlineButton{{Text: "📦 " + n, CallbackData: fmt.Sprintf("%s:%s:%d", ActRepo, key, i)}})
 	}
 	return append(kb, []InlineButton{{Text: "« Back", CallbackData: ActBack + ":" + key}})
+}
+
+// JobKeyboard is shown on an approved notice once its job has finished.
+func JobKeyboard(key string) Keyboard {
+	return Keyboard{{
+		{Text: "🔁 Retry", CallbackData: ActRetry + ":" + key},
+		{Text: "📦 Other repo", CallbackData: ActOtherRepo + ":" + key},
+	}}
 }
 
 // Job footers: progress of the agent run on an approved task.

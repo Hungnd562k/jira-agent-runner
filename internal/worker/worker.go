@@ -26,6 +26,11 @@ type IssueGetter interface {
 	GetIssue(ctx context.Context, key string) (jira.IssueDetail, error)
 }
 
+// Commenter posts a comment on a Jira issue.
+type Commenter interface {
+	AddComment(ctx context.Context, key, body string) error
+}
+
 // Messenger is the Telegram surface the worker needs (no getUpdates: the notifier owns polling).
 type Messenger interface {
 	SendMessage(ctx context.Context, chatID int64, html string, kb telegram.Keyboard, replyTo int64) (int64, error)
@@ -52,7 +57,8 @@ type Worker struct {
 	Jira         IssueGetter
 	TG           Messenger
 	ChatID       int64
-	MR           MROpener // nil or NoPush → commit locally only
+	MR           MROpener  // nil or NoPush → commit locally only
+	Comment      Commenter // optional: comment on the Jira issue once a Draft MR exists
 	NoPush       bool
 	Claude       agent.ClaudeSpec // Bin, MaxBudgetUSD, Model, Timeout; Dir/Prompt/Tools/LogPath set per job
 	TestTimeout  time.Duration
@@ -112,7 +118,8 @@ func (w *Worker) RunOnce(ctx context.Context) (did bool, err error) {
 	log.Info("job started")
 	w.updateNotice(ctx, job)
 
-	res, detail := w.process(ctx, log, job)
+	rep := &Report{}
+	res, detail := w.process(ctx, log, job, rep)
 	if res.Status == "" {
 		res.Status = store.JobSucceeded
 	}
@@ -126,11 +133,12 @@ func (w *Worker) RunOnce(ctx context.Context) (did bool, err error) {
 	if done.Status == store.JobFailed && detail != "" {
 		w.reply(context.WithoutCancel(ctx), done.JiraKey, "<pre>"+html.EscapeString(truncate(detail, 3000))+"</pre>")
 	}
+	w.publish(context.WithoutCancel(ctx), log, done, rep)
 	return true, nil
 }
 
 // process runs the pipeline; detail is extra log text shown on failure.
-func (w *Worker) process(ctx context.Context, log *slog.Logger, job store.Job) (res store.JobResult, detail string) {
+func (w *Worker) process(ctx context.Context, log *slog.Logger, job store.Job, rep *Report) (res store.JobResult, detail string) {
 	fail := func(format string, a ...any) (store.JobResult, string) {
 		return store.JobResult{Status: store.JobFailed, Error: fmt.Sprintf(format, a...)}, detail
 	}
@@ -143,8 +151,10 @@ func (w *Worker) process(ctx context.Context, log *slog.Logger, job store.Job) (
 	if err != nil {
 		return fail("load issue: %v", err)
 	}
+	rep.Key, rep.Summary, rep.IssueURL, rep.Repo = issue.Key, issue.Summary, issue.URL, repo
 
 	jobDir := filepath.Join(w.JobsDir, strconv.FormatInt(job.ID, 10))
+	rep.JobDir = jobDir
 	if err := os.MkdirAll(jobDir, 0o755); err != nil {
 		return fail("create job dir: %v", err)
 	}
@@ -177,6 +187,7 @@ func (w *Worker) process(ctx context.Context, log *slog.Logger, job store.Job) (
 		return fail("%v", err)
 	}
 	log.Info("agent done", "cost_usd", cr.CostUSD, "turns", cr.NumTurns)
+	rep.Agent, rep.Branch = cr, branch
 
 	changed, err := wt.HasChanges(ctx)
 	if err != nil {
@@ -194,11 +205,13 @@ func (w *Worker) process(ctx context.Context, log *slog.Logger, job store.Job) (
 			return fail("%v", err)
 		}
 		tests = &tr
+		rep.Tests = &tr
 		res.TestsPassed = &tr.Passed
 		log.Info("tests done", "passed", tr.Passed, "exit", tr.ExitCode)
 	}
 
 	stat := wt.DiffStat(ctx)
+	rep.DiffStat = stat
 	if err := wt.Commit(ctx, commitMessage(issue)); err != nil {
 		return fail("commit: %v", err)
 	}
@@ -219,6 +232,7 @@ func (w *Worker) process(ctx context.Context, log *slog.Logger, job store.Job) (
 		return fail("open MR: %v", err)
 	}
 	res.MRURL = url
+	rep.MRURL = url
 	return res, ""
 }
 
@@ -228,7 +242,7 @@ func (w *Worker) updateNotice(ctx context.Context, j store.Job) {
 	if err != nil || t.TGMessageID == 0 {
 		return
 	}
-	if err := w.TG.EditMessage(ctx, w.ChatID, t.TGMessageID, scheduler.ApprovedText(t, &j), nil); err != nil && !telegram.IsNotModified(err) {
+	if err := w.TG.EditMessage(ctx, w.ChatID, t.TGMessageID, scheduler.ApprovedText(t, &j), scheduler.JobKeyboard(t, &j)); err != nil && !telegram.IsNotModified(err) {
 		w.Log.Warn("edit notice", "key", j.JiraKey, "err", err)
 	}
 }
@@ -286,4 +300,23 @@ func worktreeLocation(root, repoPath string, job store.Job) (dir, name string) {
 		return root, name
 	}
 	return filepath.Dir(repoPath), ".agent-" + filepath.Base(repoPath) + "-" + name
+}
+
+// publish shares a finished job's report: report.md on disk, a Telegram reply, and a Jira
+// comment when a Draft MR was opened. Failures here never change the job's outcome.
+func (w *Worker) publish(ctx context.Context, log *slog.Logger, j store.Job, rep *Report) {
+	if !rep.ready() {
+		return
+	}
+	if err := os.WriteFile(filepath.Join(rep.JobDir, "report.md"), []byte(rep.Markdown(j)), 0o644); err != nil {
+		log.Warn("write report", "err", err)
+	}
+	if j.Status == store.JobSucceeded {
+		w.reply(ctx, j.JiraKey, rep.Telegram())
+	}
+	if rep.MRURL != "" && w.Comment != nil {
+		if err := w.Comment.AddComment(ctx, j.JiraKey, rep.JiraComment()); err != nil {
+			log.Warn("jira comment", "err", err)
+		}
+	}
 }

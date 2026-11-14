@@ -2,6 +2,7 @@ package jira
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -39,6 +40,27 @@ func TestGetIssue(t *testing.T) {
 	}
 
 	if _, err := New(srv.URL, "wrong").GetIssue(context.Background(), "X-1"); err == nil {
+		t.Error("expected error")
+	}
+}
+
+func TestAddComment(t *testing.T) {
+	var body map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/rest/api/2/issue/X-1/comment" || r.Header.Get("Authorization") != "Bearer pat" {
+			http.Error(w, "bad", http.StatusBadRequest)
+			return
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte(`{"id":"1"}`))
+	}))
+	defer srv.Close()
+
+	if err := New(srv.URL, "pat").AddComment(context.Background(), "X-1", "hello"); err != nil || body["body"] != "hello" {
+		t.Fatalf("AddComment err=%v body=%v", err, body)
+	}
+	if err := New(srv.URL, "bad").AddComment(context.Background(), "X-1", "x"); err == nil {
 		t.Error("expected error")
 	}
 }

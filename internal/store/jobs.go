@@ -173,3 +173,48 @@ func (s *Store) FinishJob(ctx context.Context, id int64, r JobResult, now time.T
 	}
 	return j, tx.Commit()
 }
+
+// ErrJobActive means the task already has a queued or running job.
+var ErrJobActive = errors.New("a job is already queued or running for this task")
+
+// Enqueue queues another job (retry / other repo) for an already approved task.
+func (s *Store) Enqueue(ctx context.Context, key, repo string, now time.Time) (Job, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Job{}, err
+	}
+	defer tx.Rollback()
+
+	var st State
+	if err := tx.QueryRowContext(ctx, `SELECT state FROM tasks WHERE jira_key = ?`, key).Scan(&st); err != nil {
+		return Job{}, err
+	}
+	if st != StateApproved {
+		return Job{}, ErrInvalidTransition
+	}
+	var active int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE jira_key = ? AND status IN (?, ?)`,
+		key, JobQueued, JobRunning).Scan(&active); err != nil {
+		return Job{}, err
+	}
+	if active > 0 {
+		return Job{}, ErrJobActive
+	}
+	res, err := tx.ExecContext(ctx, `INSERT INTO jobs (jira_key, repo_name, status, created_at) VALUES (?, ?, ?, ?)`,
+		key, repo, JobQueued, now.Unix())
+	if err != nil {
+		return Job{}, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return Job{}, err
+	}
+	if err := addEvent(ctx, tx, key, "requeued", repo, now); err != nil {
+		return Job{}, err
+	}
+	j, err := scanJob(tx.QueryRowContext(ctx, selectJob+` WHERE id = ?`, id))
+	if err != nil {
+		return Job{}, err
+	}
+	return j, tx.Commit()
+}

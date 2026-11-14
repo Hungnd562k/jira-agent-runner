@@ -31,6 +31,14 @@ func ApprovedText(t store.Task, j *store.Job) string {
 	return telegram.RenderNotice(notice(t), footer, false)
 }
 
+// JobKeyboard offers Retry / Other repo once the job has finished; nil while queued/running.
+func JobKeyboard(t store.Task, j *store.Job) telegram.Keyboard {
+	if j == nil || j.Status == store.JobQueued || j.Status == store.JobRunning {
+		return nil
+	}
+	return telegram.JobKeyboard(t.JiraKey)
+}
+
 // render is view plus job progress for approved tasks.
 func (s *Service) render(ctx context.Context, t store.Task) (string, telegram.Keyboard) {
 	if t.State != store.StateApproved {
@@ -39,7 +47,7 @@ func (s *Service) render(ctx context.Context, t store.Task) (string, telegram.Ke
 	j, err := s.Store.LatestJob(ctx, t.JiraKey)
 	switch {
 	case err == nil:
-		return ApprovedText(t, &j), nil
+		return ApprovedText(t, &j), JobKeyboard(t, &j)
 	case store.IsNotFound(err):
 		return ApprovedText(t, nil), nil
 	default:
