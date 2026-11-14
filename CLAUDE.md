@@ -27,6 +27,7 @@ docs/SPEC.md         source of truth for behavior
 - `make dry-run` — loads `.env`, one cycle, prints issues (no Telegram)
 - `make run` — run service locally with `.env`
 - `make index` — refresh GitNexus index (`gitnexus analyze .`)
+- `make up` / `make down` / `make logs` — Docker compose (one poller per bot token: stop `make run` first)
 
 ## Conventions
 - Accept `context.Context` as first arg for anything doing I/O; honor cancellation for graceful shutdown.

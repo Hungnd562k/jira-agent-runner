@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"syscall"
 	"text/tabwriter"
@@ -26,13 +27,19 @@ import (
 func main() {
 	once := flag.Bool("once", false, "run a single poll cycle and exit")
 	dryRun := flag.Bool("dry-run", false, "print issues to stdout instead of sending Telegram messages (DB is still updated)")
-	envFile := flag.String("env-file", ".env", "dotenv file to load (missing file is ignored; real env vars take precedence)")
+	envFile := flag.String("env-file", ".env", "dotenv file to load; empty disables (missing file is ignored; real env vars take precedence)")
+	healthcheck := flag.Bool("healthcheck", false, "exit 0 if the running service's heartbeat is fresh (for Docker HEALTHCHECK)")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	if err := config.LoadDotEnv(*envFile); err != nil {
+	if *envFile == "" {
+		// env already provided (e.g. docker compose env_file)
+	} else if err := config.LoadDotEnv(*envFile); err != nil {
 		log.Error("load env file", "err", err)
 		os.Exit(1)
+	}
+	if *healthcheck {
+		os.Exit(checkHeartbeat(heartbeatPath()))
 	}
 	if err := run(log, *once, *dryRun); err != nil {
 		log.Error("fatal", "err", err)
@@ -87,6 +94,12 @@ func run(log *slog.Logger, once, dryRun bool) error {
 		Now:           time.Now,
 		Log:           log,
 	}
+	hb := heartbeatPath()
+	svc.Heartbeat = func() {
+		if err := os.WriteFile(hb, []byte(time.Now().UTC().Format(time.RFC3339)), 0o644); err != nil {
+			log.Warn("write heartbeat", "err", err)
+		}
+	}
 	if once {
 		return svc.Cycle(ctx)
 	}
@@ -96,6 +109,31 @@ func run(log *slog.Logger, once, dryRun bool) error {
 }
 
 const telegramAPI = "https://api.telegram.org"
+
+// heartbeatMaxAge must exceed the 1m remind tick that refreshes the heartbeat.
+const heartbeatMaxAge = 3 * time.Minute
+
+// heartbeatPath lives next to the database so it shares the /data volume.
+func heartbeatPath() string {
+	db := os.Getenv("DB_PATH")
+	if db == "" {
+		db = "./data/tasks.db"
+	}
+	return filepath.Join(filepath.Dir(db), "heartbeat")
+}
+
+func checkHeartbeat(path string) int {
+	fi, err := os.Stat(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "unhealthy:", err)
+		return 1
+	}
+	if age := time.Since(fi.ModTime()); age > heartbeatMaxAge {
+		fmt.Fprintf(os.Stderr, "unhealthy: heartbeat is %s old\n", age.Round(time.Second))
+		return 1
+	}
+	return 0
+}
 
 func printResult(w io.Writer, res *scheduler.SyncResult) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)

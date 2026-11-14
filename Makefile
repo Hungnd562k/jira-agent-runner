@@ -27,3 +27,14 @@ tidy:
 # Refresh the GitNexus knowledge graph after code changes.
 index:
 	gitnexus analyze .
+
+# Docker (see docker-compose.yml). Stop any local `make run` first: one bot token = one poller.
+.PHONY: up down logs
+up:
+	docker compose up -d --build
+
+down:
+	docker compose down
+
+logs:
+	docker compose logs -f --no-log-prefix

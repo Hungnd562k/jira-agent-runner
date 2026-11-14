@@ -10,7 +10,7 @@ Poll Jira for unresolved bugs assigned to me → notify via Telegram with action
 | Database | SQLite via `modernc.org/sqlite` (pure Go), migrations embedded with `//go:embed` |
 | Jira | Server/Data Center, REST API v2 (`/rest/api/2/search`), `Authorization: Bearer <PAT>` |
 | Telegram | Bot API, **long polling** (`getUpdates`) — no public URL needed. Own minimal client on `net/http` (no dependency); throttled ~1 msg/s, one retry on HTTP 429 |
-| Deploy | Docker, multi-stage → `gcr.io/distroless/static`, volume `./data:/data`, `mem_limit: 64m` |
+| Deploy | Docker, multi-stage → `gcr.io/distroless/static-debian12:nonroot` (~22MB), compose: `env_file: .env`, volume `./data:/data`, runs as host UID, `mem_limit: 64m`, `cpus: 0.25`, read-only rootfs, built-in healthcheck. Measured idle RAM ≈ 7.5MiB |
 | Phase 2 agent | Claude Code CLI headless (`claude -p`) in sandbox container |
 | Phase 2 MR | GitLab API, draft MR (`Draft:` title prefix) |
 
@@ -27,7 +27,7 @@ Poll Jira for unresolved bugs assigned to me → notify via Telegram with action
 | `SNOOZE_CHOICES` | `30m,2h,24h` | buttons for "Remind me after…" |
 | `DB_PATH` | `./data/tasks.db` | `/data/tasks.db` in Docker |
 
-CLI flags: `--once` (single cycle then exit), `--dry-run` (print to stdout, no Telegram; DB is still updated; Telegram vars not validated), `--env-file` (default `.env`).
+CLI flags: `--once` (single cycle then exit), `--dry-run` (print to stdout, no Telegram; DB is still updated; Telegram vars not validated), `--env-file` (default `.env`; empty disables — used in Docker), `--healthcheck` (exit 0 if `<dir of DB_PATH>/heartbeat` is < 3m old; the main loop rewrites it every minute).
 
 `.env` is read by the binary itself with literal values (same as `docker compose env_file`): no shell quoting needed, real env vars take precedence. `JIRA_BASE_URL` must be the Jira root — page URLs (`/secure/…`, `/browse/…`, query strings) are rejected. `TELEGRAM_CHAT_ID` is the numeric chat id, not the bot username.
 

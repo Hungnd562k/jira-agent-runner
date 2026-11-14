@@ -31,6 +31,7 @@ type Service struct {
 	RemindAfter   time.Duration // re-remind notified tasks untouched this long
 	RemindCheck   time.Duration // how often due reminders are checked (default 1m)
 	SendGap       time.Duration // pause between outgoing messages (Telegram: ~1 msg/s per chat)
+	Heartbeat     func()        // optional; called each loop tick to prove the main loop is alive
 	Now           func() time.Time
 	Log           *slog.Logger
 
@@ -47,6 +48,13 @@ func (s *Service) Run(ctx context.Context) error {
 		check = time.Minute
 	}
 
+	beat := func() {
+		if s.Heartbeat != nil {
+			s.Heartbeat()
+		}
+	}
+
+	beat()
 	s.runCycle(ctx)
 	poll := time.NewTicker(s.PollInterval)
 	defer poll.Stop()
@@ -60,6 +68,7 @@ func (s *Service) Run(ctx context.Context) error {
 		case <-poll.C:
 			s.runCycle(ctx)
 		case <-remind.C:
+			beat()
 			if err := s.Remind(ctx); err != nil && ctx.Err() == nil {
 				s.Log.Error("remind failed", "err", err)
 			}
