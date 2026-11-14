@@ -28,6 +28,8 @@ type Service struct {
 	ChatID        int64
 	SnoozeChoices []time.Duration
 	PollInterval  time.Duration
+	RemindAfter   time.Duration // re-remind notified tasks untouched this long
+	RemindCheck   time.Duration // how often due reminders are checked (default 1m)
 	SendGap       time.Duration // pause between outgoing messages (Telegram: ~1 msg/s per chat)
 	Now           func() time.Time
 	Log           *slog.Logger
@@ -40,16 +42,63 @@ func (s *Service) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	wg.Go(func() { s.listen(ctx) })
 
+	check := s.RemindCheck
+	if check <= 0 {
+		check = time.Minute
+	}
+
 	s.runCycle(ctx)
-	t := time.NewTicker(s.PollInterval)
-	defer t.Stop()
+	poll := time.NewTicker(s.PollInterval)
+	defer poll.Stop()
+	remind := time.NewTicker(check)
+	defer remind.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			wg.Wait()
 			return nil
-		case <-t.C:
+		case <-poll.C:
 			s.runCycle(ctx)
+		case <-remind.C:
+			if err := s.Remind(ctx); err != nil && ctx.Err() == nil {
+				s.Log.Error("remind failed", "err", err)
+			}
+		}
+	}
+}
+
+// Remind re-sends notices that are due (untouched for RemindAfter, or snooze expired)
+// as a reply to the previous message, and strips the buttons from that older message.
+func (s *Service) Remind(ctx context.Context) error {
+	due, err := s.Store.ListDue(ctx, s.Now(), s.RemindAfter)
+	if err != nil {
+		return err
+	}
+	for i, t := range due {
+		if i > 0 && !sleep(ctx, s.SendGap) {
+			return ctx.Err()
+		}
+		s.withLock(func() { s.remindOne(ctx, t.JiraKey) })
+	}
+	return nil
+}
+
+func (s *Service) remindOne(ctx context.Context, key string) {
+	// Re-read under the lock: a button press may have changed the task since ListDue.
+	t, err := s.Store.Get(ctx, key)
+	if err != nil || !store.IsDue(t, s.Now(), s.RemindAfter) {
+		return
+	}
+	old := t.TGMessageID
+	if err := s.send(ctx, t, telegram.FooterReminder(), old); err != nil {
+		s.Log.Error("send reminder", "key", key, "err", err)
+		return
+	}
+	s.Log.Info("reminder sent", "key", key, "was", t.State)
+	if old != 0 {
+		text := telegram.RenderNotice(notice(t), telegram.FooterSuperseded(), false)
+		if err := s.TG.EditMessage(ctx, s.ChatID, old, text, nil); err != nil && !telegram.IsNotModified(err) {
+			s.Log.Warn("strip old buttons", "key", key, "msg", old, "err", err)
 		}
 	}
 }

@@ -76,6 +76,9 @@ func FooterSnoozed(until time.Time) string {
 func FooterClosed() string   { return "🔒 No longer open/assigned in Jira" }
 func FooterReminder() string { return "🔔 Reminder — still waiting for your decision" }
 
+// FooterSuperseded marks an older notice whose buttons moved to a newer reminder.
+func FooterSuperseded() string { return "↪ Reminder sent below" }
+
 // RenderNotice formats a task as Telegram HTML. strike crosses out the title (closed tasks).
 func RenderNotice(n Notice, footer string, strike bool) string {
 	title := fmt.Sprintf("<b>[%s]</b> %s", html.EscapeString(n.Key), html.EscapeString(n.Summary))

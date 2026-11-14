@@ -81,6 +81,8 @@ func run(log *slog.Logger, once, dryRun bool) error {
 		ChatID:        cfg.TelegramChatID,
 		SnoozeChoices: cfg.SnoozeChoices,
 		PollInterval:  cfg.PollInterval,
+		RemindAfter:   cfg.RemindInterval,
+		RemindCheck:   time.Minute,
 		SendGap:       time.Second,
 		Now:           time.Now,
 		Log:           log,

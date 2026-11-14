@@ -72,3 +72,30 @@ func (s *Store) Snooze(ctx context.Context, key string, until, now time.Time) (T
 
 // IsNotFound reports whether err means the task does not exist.
 func IsNotFound(err error) bool { return errors.Is(err, sql.ErrNoRows) }
+
+// IsDue reports whether t needs a reminder at now: a notified task untouched for
+// remindAfter, or a snoozed task whose snooze has expired.
+func IsDue(t Task, now time.Time, remindAfter time.Duration) bool {
+	switch t.State {
+	case StateNotified:
+		return !t.LastNotifiedAt.IsZero() && !now.Before(t.LastNotifiedAt.Add(remindAfter))
+	case StateSnoozed:
+		return !t.RemindAt.IsZero() && !now.Before(t.RemindAt)
+	}
+	return false
+}
+
+// ListDue returns tasks that need a reminder at now (see IsDue).
+func (s *Store) ListDue(ctx context.Context, now time.Time, remindAfter time.Duration) ([]Task, error) {
+	open, err := s.ListByState(ctx, StateNotified, StateSnoozed)
+	if err != nil {
+		return nil, err
+	}
+	var due []Task
+	for _, t := range open {
+		if IsDue(t, now, remindAfter) {
+			due = append(due, t)
+		}
+	}
+	return due, nil
+}

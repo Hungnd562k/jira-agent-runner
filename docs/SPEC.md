@@ -45,7 +45,8 @@ new ──send──▶ notified ──(untouched > REMIND_INTERVAL)──▶ no
 any open state ──(issue no longer matches JQL)──▶ closed (buttons removed)
 ```
 - Callback data (≤64 bytes): `fix:<KEY>`, `snz:<KEY>` (show choices), `snz:<KEY>:<dur>`.
-- Re-reminders reply to the original message.
+- Due reminders are checked every 1m: `notified` untouched for `REMIND_INTERVAL`, or `snoozed` past `remind_at`. A reminder is sent as a reply to the previous notice (footer "🔔 Reminder"); the previous notice loses its buttons ("↪ Reminder sent below"). `approved`/`closed` are never reminded.
+- Long-running mode stops gracefully on SIGINT/SIGTERM.
 
 ## Message format
 ```

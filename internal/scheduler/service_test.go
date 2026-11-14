@@ -170,3 +170,67 @@ func TestClosedIssueStrikesMessage(t *testing.T) {
 		t.Fatalf("closed edit = %+v", last)
 	}
 }
+
+func TestRemindUntouchedAndSnoozed(t *testing.T) {
+	ctx := context.Background()
+	s, _, tg := newService(t, jira.Issue{Key: "A-1", Summary: "bug", URL: "u"}, jira.Issue{Key: "A-2", Summary: "bug2", URL: "u"})
+	clock := time.Unix(1_800_000_000, 0)
+	s.Now = func() time.Time { return clock }
+	s.Syncer.Now = s.Now
+	s.RemindAfter = 4 * time.Hour
+
+	s.Cycle(ctx) // A-1 → msg 1, A-2 → msg 2
+	press(s, chatID, 2, "snz:A-2:30m0s")
+
+	clock = clock.Add(29 * time.Minute)
+	s.Remind(ctx)
+	if len(tg.sent) != 2 {
+		t.Fatalf("reminded too early: %d sends", len(tg.sent))
+	}
+
+	clock = clock.Add(time.Minute) // snooze expired
+	s.Remind(ctx)
+	if len(tg.sent) != 3 {
+		t.Fatalf("snoozed task not reminded: %d sends", len(tg.sent))
+	}
+	r := tg.sent[2]
+	if r.replyTo != 2 || !strings.Contains(r.text, "Reminder") || len(r.kb) != 1 {
+		t.Fatalf("reminder = %+v", r)
+	}
+	old := tg.edits[len(tg.edits)-1]
+	if old.msgID != 2 || len(old.kb) != 0 || !strings.Contains(old.text, "Reminder sent below") {
+		t.Fatalf("old message not stripped: %+v", old)
+	}
+	task, _ := s.Store.Get(ctx, "A-2")
+	if task.State != store.StateNotified || task.TGMessageID != 3 || !task.RemindAt.IsZero() {
+		t.Fatalf("A-2 after reminder = %+v", task)
+	}
+
+	clock = time.Unix(1_800_000_000, 0).Add(4 * time.Hour) // A-1 untouched for RemindAfter
+	s.Remind(ctx)
+	if len(tg.sent) != 4 || tg.sent[3].replyTo != 1 {
+		t.Fatalf("untouched task not reminded: %+v", tg.sent)
+	}
+
+	s.Remind(ctx) // nothing due right after reminding
+	if len(tg.sent) != 4 {
+		t.Fatalf("duplicate reminder: %d sends", len(tg.sent))
+	}
+}
+
+func TestApprovedNeverReminded(t *testing.T) {
+	ctx := context.Background()
+	s, _, tg := newService(t, jira.Issue{Key: "A-1", Summary: "bug", URL: "u"})
+	clock := time.Unix(1_800_000_000, 0)
+	s.Now = func() time.Time { return clock }
+	s.Syncer.Now = s.Now
+	s.RemindAfter = time.Hour
+
+	s.Cycle(ctx)
+	press(s, chatID, 1, "fix:A-1")
+	clock = clock.Add(48 * time.Hour)
+	s.Remind(ctx)
+	if len(tg.sent) != 1 {
+		t.Fatalf("approved task reminded: %d sends", len(tg.sent))
+	}
+}
