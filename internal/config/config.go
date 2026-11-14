@@ -83,22 +83,25 @@ func Load(requireTelegram bool) (*Config, error) {
 }
 
 // validateBaseURL rejects page URLs pasted from the browser (boards, issues, REST paths).
-func validateBaseURL(raw string) error {
+func validateBaseURL(raw string) error { return validateRootURL("JIRA_BASE_URL", raw) }
+
+// validateRootURL requires an http(s) service root, not a page/API URL pasted from a browser.
+func validateRootURL(name, raw string) error {
 	if raw == "" {
-		return errors.New("JIRA_BASE_URL is required")
+		return fmt.Errorf("%s is required", name)
 	}
 	u, err := url.Parse(raw)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return fmt.Errorf("JIRA_BASE_URL must be an http(s) URL, got %q", raw)
+		return fmt.Errorf("%s must be an http(s) URL, got %q", name, raw)
 	}
 	bad := u.RawQuery != "" || u.Fragment != ""
-	for _, seg := range []string{"/secure/", "/browse/", "/rest/", "/projects/"} {
+	for _, seg := range []string{"/secure/", "/browse/", "/rest/", "/projects/", "/api/", "/-/"} {
 		if strings.Contains(u.Path+"/", seg) {
 			bad = true
 		}
 	}
 	if bad {
-		return fmt.Errorf("JIRA_BASE_URL must be the Jira root (e.g. %s://%s), not a page URL", u.Scheme, u.Host)
+		return fmt.Errorf("%s must be the service root (e.g. %s://%s), not a page URL", name, u.Scheme, u.Host)
 	}
 	return nil
 }

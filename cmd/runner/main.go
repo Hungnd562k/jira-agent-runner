@@ -30,6 +30,8 @@ func main() {
 	dryRun := flag.Bool("dry-run", false, "print issues to stdout instead of sending Telegram messages (DB is still updated)")
 	envFile := flag.String("env-file", ".env", "dotenv file to load; empty disables (missing file is ignored; real env vars take precedence)")
 	healthcheck := flag.Bool("healthcheck", false, "exit 0 if the running service's heartbeat is fresh (for Docker HEALTHCHECK)")
+	workerMode := flag.Bool("worker", false, "run the agent worker (on the host): process approved jobs instead of polling Jira")
+	noPush := flag.Bool("no-push", false, "worker: commit on a local branch only; do not push or open a merge request")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -42,7 +44,11 @@ func main() {
 	if *healthcheck {
 		os.Exit(checkHeartbeat(heartbeatPath()))
 	}
-	if err := run(log, *once, *dryRun); err != nil {
+	run := func() error { return run(log, *once, *dryRun) }
+	if *workerMode {
+		run = func() error { return runWorker(log, *once, *noPush) }
+	}
+	if err := run(); err != nil {
 		log.Error("fatal", "err", err)
 		os.Exit(1)
 	}

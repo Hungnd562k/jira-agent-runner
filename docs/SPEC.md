@@ -75,3 +75,18 @@ Priority: High · Status: Open
 
 ### Jobs
 Table `jobs` (migration 002): `queued → running → succeeded | failed`, with `branch`, `mr_url`, `error`, `tests_passed`. Approved notices show the latest job's progress (Queued / Agent running / Done + Draft MR + tests / Failed).
+
+### Worker (`runner --worker`, on the host)
+Runs where `claude` (logged in), git SSH credentials and repo toolchains exist; shares `./data/tasks.db` with the notifier container. Never calls `getUpdates` (only send/edit), so it does not conflict with the notifier's long polling. One job at a time; on start, jobs left `running` are marked `failed: interrupted`.
+
+Pipeline per job:
+1. `GetIssue` (summary, description, type, priority, components, labels, last 5 comments).
+2. `git fetch origin <base>` → `git worktree add -b agent/<KEY>-j<jobid> <WORKTREE_DIR>/<KEY>-j<jobid> origin/<base>`.
+3. `claude -p` (prompt on stdin) `--output-format json --permission-mode acceptEdits --allowedTools Read Edit Write Glob Grep Bash(git diff:*) Bash(git status:*) Bash(git log:*) <repo allowed_tools> --max-budget-usd <AGENT_MAX_BUDGET_USD> [--model]`, timeout `AGENT_TIMEOUT` (kills the process group). The agent must not commit/push. Raw output: `data/jobs/<id>/agent.json`.
+4. No changes → `failed: agent made no changes` (agent's explanation sent as a reply).
+5. The worker runs `test_cmd` itself (`sh -c`, timeout `TEST_TIMEOUT`) → `data/jobs/<id>/test.log`; failing tests do not abort.
+6. Commit `fix(<KEY>): <summary>` (+ Jira link, `Co-Authored-By: Claude`), host git identity.
+7. `--no-push`: stop here (branch kept locally). Otherwise `git push -u origin <branch>` and `POST /api/v4/projects/<path>/merge_requests` with title `Draft: [<KEY>] <summary>`, target `base_branch`, `remove_source_branch`, description = Jira link, test result (❌ = do not merge), agent report, diff stat, test log tail.
+8. Worktree removed (branch kept); job + notice updated (`Done … Draft MR · tests ✅/❌` or `Failed: …`).
+
+Worker env: `GITLAB_BASE_URL`, `GITLAB_TOKEN` (`api` scope; required unless `--no-push`), `WORKTREE_DIR` (`~/.cache/jira-agent-runner/worktrees`), `CLAUDE_BIN` (`claude`), `AGENT_TIMEOUT` (`30m`), `AGENT_MAX_BUDGET_USD` (`5`), `AGENT_MODEL`, `TEST_TIMEOUT` (`15m`). Run with `make worker-local` (no push) / `make worker`, or the systemd user unit in `deploy/`.

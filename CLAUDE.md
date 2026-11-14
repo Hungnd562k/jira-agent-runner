@@ -7,7 +7,8 @@ Service that polls Jira (Server/DC) for assigned bugs, asks for approval in Tele
 - SQLite via `modernc.org/sqlite`; schema changes go in embedded migration files under `internal/store/`, never ad-hoc `ALTER` in code.
 - Jira: REST API v2 with Bearer PAT, plain `net/http`. Telegram: long polling via the own minimal client in `internal/telegram` (`net/http`, no lib).
 - Logging: `log/slog`. Never log tokens/PATs.
-- Config only from env (`internal/config`); every new var goes into `.env.example` and the SPEC table.
+- Config only from env (`internal/config`); every new var goes into `.env.example` and the SPEC table. Exception: `repos.json` (nested repo list, git-ignored, see `repos.example.json`).
+- Two processes share `data/tasks.db`: the notifier (Docker, owns Telegram `getUpdates`) and the worker (host, `--worker`, never polls Telegram). Keep it that way.
 
 ## Layout
 ```
@@ -16,7 +17,12 @@ internal/config/     env loading + validation
 internal/jira/       Jira client
 internal/store/      SQLite store + migrations
 internal/telegram/   bot, message rendering, callback handling
-internal/scheduler/  poll + remind loops (inject a clock for tests)
+internal/scheduler/  poll + remind loops, Fix it / repo selection (inject a clock for tests)
+internal/repos/      repos.json: Jira project -> candidate GitLab repos
+internal/worker/     host-side job pipeline (claim -> agent -> tests -> commit -> MR)
+internal/agent/      git worktree helpers, `claude -p` runner, test runner, prompt
+internal/gitlab/     GitLab v4 client (draft MR)
+deploy/              systemd user unit for the worker
 docs/SPEC.md         source of truth for behavior
 ```
 
@@ -28,6 +34,7 @@ docs/SPEC.md         source of truth for behavior
 - `make run` — run service locally with `.env`
 - `make index` — refresh GitNexus index (`gitnexus analyze .`)
 - `make up` / `make down` / `make logs` — Docker compose (one poller per bot token: stop `make run` first)
+- `make worker-local` / `make worker` — agent worker on the host (without / with push + draft MR)
 
 ## Conventions
 - Accept `context.Context` as first arg for anything doing I/O; honor cancellation for graceful shutdown.

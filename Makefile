@@ -42,3 +42,12 @@ logs:
 # Bind mount needs the file to exist; start with no repos (Fix it just approves).
 repos.json:
 	echo '{}' > repos.json
+
+# Agent worker runs on the host (needs claude CLI, git SSH access, repo toolchains).
+.PHONY: worker worker-local
+worker: build
+	./bin/runner --worker
+
+# Safe first run: commit on a local branch only, no push / no MR.
+worker-local: build
+	./bin/runner --worker --no-push
