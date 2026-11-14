@@ -17,6 +17,11 @@ const (
 	ActRepo       = "repo" // repo:<KEY>:<index>   → approve + queue agent on that repo
 	ActRetry      = "rty"  // rty:<KEY>            → re-run the agent on the last job's repo
 	ActOtherRepo  = "orp"  // orp:<KEY>            → pick another repo for a new job
+
+	// Handover callbacks carry the handover id in Key.
+	ActHandoverYes     = "hoy" // hoy:<id> → create + approve + merge dev → test MRs
+	ActHandoverLater   = "hol" // hol:<id> → ask again later
+	ActHandoverRewatch = "hor" // hor:<id> → watch CI/CD again after a retry in GitLab
 )
 
 // Callback is a parsed callback_data.
@@ -37,7 +42,9 @@ func ParseCallback(data string) (Callback, error) {
 	switch {
 	case cb.Action == ActFix && len(parts) == 2, cb.Action == ActBack && len(parts) == 2,
 		cb.Action == ActSnoozeMenu && len(parts) == 2,
-		cb.Action == ActRetry && len(parts) == 2, cb.Action == ActOtherRepo && len(parts) == 2:
+		cb.Action == ActRetry && len(parts) == 2, cb.Action == ActOtherRepo && len(parts) == 2,
+		cb.Action == ActHandoverYes && len(parts) == 2, cb.Action == ActHandoverLater && len(parts) == 2,
+		cb.Action == ActHandoverRewatch && len(parts) == 2:
 		return cb, nil
 	case cb.Action == ActSnooze && len(parts) == 3:
 		d, err := time.ParseDuration(parts[2])
@@ -90,6 +97,31 @@ func JobKeyboard(key string) Keyboard {
 		{Text: "🔁 Retry", CallbackData: ActRetry + ":" + key},
 		{Text: "📦 Other repo", CallbackData: ActOtherRepo + ":" + key},
 	}}
+}
+
+// HandoverKeyboard asks whether to merge dev → test and hand over now.
+func HandoverKeyboard(id int64) Keyboard {
+	sid := strconv.FormatInt(id, 10)
+	return Keyboard{{
+		{Text: "🚀 Có, merge sang test", CallbackData: ActHandoverYes + ":" + sid},
+		{Text: "⏰ Để sau", CallbackData: ActHandoverLater + ":" + sid},
+	}}
+}
+
+// RewatchKeyboard is shown on a failed CI/CD report.
+func RewatchKeyboard(id int64) Keyboard {
+	return Keyboard{{{Text: "🔁 Theo dõi lại CI/CD", CallbackData: ActHandoverRewatch + ":" + strconv.FormatInt(id, 10)}}}
+}
+
+// FooterMerged: the fix is in the shared dev branch, waiting for the next handover.
+func FooterMerged(repo, mrURL string) string {
+	return "🔀 <b>Merged vào dev</b> (<code>" + html.EscapeString(repo) + `</code>, <a href="` + html.EscapeString(mrURL) +
+		`">MR</a>) — chờ bàn giao`
+}
+
+// FooterDelivered: the handover CI/CD succeeded.
+func FooterDelivered(repo string) string {
+	return "🚀 <b>Đã bàn giao test</b> (<code>" + html.EscapeString(repo) + "</code>)"
 }
 
 // Job footers: progress of the agent run on an approved task.

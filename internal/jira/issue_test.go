@@ -94,3 +94,44 @@ func TestAddAttachment(t *testing.T) {
 		t.Error("expected error on HTTP 400")
 	}
 }
+
+func TestTransitionAndAssign(t *testing.T) {
+	var posted, assigned map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/rest/api/2/issue/X-1" && r.URL.Query().Get("fields") == "status":
+			fmt.Fprint(w, `{"fields":{"status":{"name":"In Progress"}}}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/rest/api/2/issue/X-1/transitions":
+			fmt.Fprint(w, `{"transitions":[{"id":"11","name":"Start","to":{"name":"In Progress"}},
+				{"id":"5","name":"Resolve Issue","to":{"name":"Resolved"},"fields":{"resolution":{"required":true}}}]}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/rest/api/2/issue/X-1/transitions":
+			json.NewDecoder(r.Body).Decode(&posted)
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && r.URL.Query().Get("fields") == "reporter":
+			fmt.Fprint(w, `{"fields":{"reporter":{"name":"qc.an","displayName":"QC An"}}}`)
+		case r.Method == http.MethodPut && r.URL.Path == "/rest/api/2/issue/X-1/assignee":
+			json.NewDecoder(r.Body).Decode(&assigned)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(w, "unexpected "+r.Method+" "+r.URL.String(), http.StatusBadRequest)
+		}
+	}))
+	defer srv.Close()
+	c := New(srv.URL, "pat")
+	ctx := context.Background()
+
+	to, err := c.Transition(ctx, "X-1", "resolved", "Fixed")
+	if err != nil || to != "Resolved" {
+		t.Fatalf("Transition = %q %v", to, err)
+	}
+	if posted["transition"].(map[string]any)["id"] != "5" || posted["fields"].(map[string]any)["resolution"].(map[string]any)["name"] != "Fixed" {
+		t.Errorf("transition payload = %v", posted)
+	}
+	if _, err := c.Transition(ctx, "X-1", "Closed", ""); err == nil || !strings.Contains(err.Error(), "Resolve Issue→Resolved") {
+		t.Errorf("missing transition error = %v", err)
+	}
+	name, err := c.AssignToReporter(ctx, "X-1")
+	if err != nil || name != "QC An" || assigned["name"] != "qc.an" {
+		t.Fatalf("AssignToReporter = %q %v %v", name, err, assigned)
+	}
+}

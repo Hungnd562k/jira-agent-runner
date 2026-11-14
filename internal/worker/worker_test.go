@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -40,17 +41,55 @@ func (f *fakeTG) EditMessage(_ context.Context, _, _ int64, html string, _ teleg
 	return nil
 }
 
+// fakeMR is an in-memory GitLab: MRs get iid 1, 2, …; pipeline is what FindPipeline/GetPipeline return.
 type fakeMR struct {
-	req *MRRequest
-	err error
+	req      *MRRequest
+	reqs     []MRRequest
+	err      error // OpenMR error
+	mergeErr error
+	approved []int64
+	merged   []int64
+	pipeline *Pipeline
+	failed   []PipelineJob
 }
 
-func (f *fakeMR) OpenDraftMR(_ context.Context, r MRRequest) (string, error) {
+func (f *fakeMR) OpenMR(_ context.Context, r MRRequest) (MR, error) {
 	f.req = &r
 	if f.err != nil {
-		return "", f.err
+		return MR{}, f.err
 	}
-	return "https://gitlab/mr/1", nil
+	f.reqs = append(f.reqs, r)
+	n := int64(len(f.reqs))
+	return MR{IID: n, WebURL: fmt.Sprintf("https://gitlab/mr/%d", n)}, nil
+}
+func (f *fakeMR) FindOpenMR(context.Context, string, string, string) (MR, bool, error) {
+	return MR{}, false, nil
+}
+func (f *fakeMR) ApproveMR(_ context.Context, _ string, iid int64) error {
+	f.approved = append(f.approved, iid)
+	return nil
+}
+func (f *fakeMR) MergeMR(_ context.Context, _ string, iid int64, _ bool) (string, error) {
+	if f.mergeErr != nil {
+		return "", f.mergeErr
+	}
+	f.merged = append(f.merged, iid)
+	return fmt.Sprintf("sha%d", iid), nil
+}
+func (f *fakeMR) FindPipeline(context.Context, string, string, string) (Pipeline, bool, error) {
+	if f.pipeline == nil {
+		return Pipeline{}, false, nil
+	}
+	return *f.pipeline, true, nil
+}
+func (f *fakeMR) GetPipeline(context.Context, string, int64) (Pipeline, error) {
+	return *f.pipeline, nil
+}
+func (f *fakeMR) FailedJobs(context.Context, string, int64) ([]PipelineJob, error) {
+	return f.failed, nil
+}
+func (f *fakeMR) JobLogTail(context.Context, string, int64, int) (string, error) {
+	return "error CS1002: ; expected", nil
 }
 
 func git(t *testing.T, dir string, args ...string) string {
@@ -82,6 +121,7 @@ func setup(t *testing.T, claudeScript string) (*Worker, *fakeTG, string, string)
 	git(t, clone, "add", "-A")
 	git(t, clone, "commit", "-m", "init")
 	git(t, clone, "push", "origin", "HEAD:main")
+	git(t, clone, "push", "origin", "HEAD:test")
 
 	bin := filepath.Join(root, "fake-claude.sh")
 	os.WriteFile(bin, []byte("#!/bin/sh\ncat > /dev/null\n"+claudeScript), 0o755)
@@ -168,7 +208,7 @@ func TestPipelinePushAndMR(t *testing.T) {
 	if out := git(t, origin, "branch", "--list", "agent/X-1-j1"); out == "" {
 		t.Error("branch not pushed to origin")
 	}
-	if mr.req == nil || mr.req.Title != "Draft: [X-1] Crash on save" || !strings.Contains(mr.req.Description, "✅") ||
+	if mr.req == nil || mr.req.Title != "[X-1] Crash on save" || !mr.req.Draft || !strings.Contains(mr.req.Description, "✅") ||
 		!strings.Contains(mr.req.Description, "Root cause") {
 		t.Fatalf("mr request = %+v", mr.req)
 	}

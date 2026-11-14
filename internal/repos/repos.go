@@ -20,6 +20,11 @@ type Repo struct {
 	TestCmd       string   `json:"test_cmd"`       // shell command run in the worktree for test evidence
 	AllowedTools  []string `json:"allowed_tools"`  // extra Claude Code tool permissions, e.g. "Bash(dotnet test:*)"
 	E2E           *E2E     `json:"e2e,omitempty"`  // set = the agent must verify the fix in a browser
+	// AutoMerge merges the agent's MR into base_branch when tests pass and E2E (if configured) is ✅.
+	AutoMerge bool `json:"auto_merge"`
+	// HandoverBranch is the deploy branch (e.g. "test"): merged fixes are handed over by a
+	// base_branch → HandoverBranch MR after the user confirms on Telegram. Empty = no handover.
+	HandoverBranch string `json:"handover_branch"`
 }
 
 // E2E configures local browser verification for a web repo.
@@ -101,6 +106,9 @@ func (c Config) validate() error {
 			}
 			if r.BaseBranch == "" {
 				errs = append(errs, fmt.Errorf("%s: base_branch is required", where))
+			}
+			if r.HandoverBranch != "" && r.HandoverBranch == r.BaseBranch {
+				errs = append(errs, fmt.Errorf("%s: handover_branch must differ from base_branch", where))
 			}
 			if e := r.E2E; e != nil {
 				if !strings.HasPrefix(e.BaseURL, "http://") && !strings.HasPrefix(e.BaseURL, "https://") {

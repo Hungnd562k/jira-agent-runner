@@ -16,6 +16,12 @@ func JobFooter(j store.Job) string {
 		return telegram.FooterRunning(j.RepoName)
 	case store.JobFailed:
 		return telegram.FooterFailed(j.RepoName, j.Error)
+	}
+	switch {
+	case !j.DeliveredAt.IsZero():
+		return telegram.FooterDelivered(j.RepoName)
+	case !j.MergedAt.IsZero():
+		return telegram.FooterMerged(j.RepoName, j.MRURL)
 	default:
 		return telegram.FooterDone(j.RepoName, j.MRURL, j.Branch, j.TestsPassed)
 	}
@@ -33,8 +39,8 @@ func ApprovedText(t store.Task, j *store.Job) string {
 
 // JobKeyboard offers Retry / Other repo once the job has finished; nil while queued/running.
 func JobKeyboard(t store.Task, j *store.Job) telegram.Keyboard {
-	if j == nil || j.Status == store.JobQueued || j.Status == store.JobRunning {
-		return nil
+	if j == nil || j.Status == store.JobQueued || j.Status == store.JobRunning || !j.MergedAt.IsZero() {
+		return nil // merged fixes are not retried from Telegram
 	}
 	return telegram.JobKeyboard(t.JiraKey)
 }

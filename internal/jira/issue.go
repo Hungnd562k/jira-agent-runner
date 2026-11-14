@@ -198,3 +198,107 @@ func (c *Client) AddAttachment(ctx context.Context, key, path, name string) (str
 	}
 	return out[0].Filename, nil
 }
+
+// jsonDo sends a JSON request with the PAT; out may be nil. want is the success status.
+func (c *Client) jsonDo(ctx context.Context, op, method, path string, in, out any, want int) error {
+	var body io.Reader
+	if in != nil {
+		b, err := json.Marshal(in)
+		if err != nil {
+			return err
+		}
+		body = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.pat)
+	req.Header.Set("Accept", "application/json")
+	if in != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("jira %s: %w", op, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != want {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("jira %s: HTTP %d: %s", op, resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	if out != nil {
+		return json.NewDecoder(resp.Body).Decode(out)
+	}
+	return nil
+}
+
+// Transition moves an issue through the workflow transition whose target status (or name)
+// equals toStatus, case-insensitive. resolution is sent only when the transition screen has
+// a resolution field. Returns the status reached. Already in toStatus = no-op.
+func (c *Client) Transition(ctx context.Context, key, toStatus, resolution string) (string, error) {
+	base := "/rest/api/2/issue/" + url.PathEscape(key)
+	var cur struct {
+		Fields struct {
+			Status struct{ Name string } `json:"status"`
+		} `json:"fields"`
+	}
+	if err := c.jsonDo(ctx, "get status", http.MethodGet, base+"?fields=status", nil, &cur, http.StatusOK); err != nil {
+		return "", err
+	}
+	if strings.EqualFold(cur.Fields.Status.Name, toStatus) {
+		return cur.Fields.Status.Name, nil
+	}
+	var list struct {
+		Transitions []struct {
+			ID     string                     `json:"id"`
+			Name   string                     `json:"name"`
+			To     struct{ Name string }      `json:"to"`
+			Fields map[string]json.RawMessage `json:"fields"`
+		} `json:"transitions"`
+	}
+	if err := c.jsonDo(ctx, "transitions", http.MethodGet, base+"/transitions?expand=transitions.fields", nil, &list, http.StatusOK); err != nil {
+		return "", err
+	}
+	var names []string
+	for _, t := range list.Transitions {
+		names = append(names, fmt.Sprintf("%s→%s", t.Name, t.To.Name))
+		if !strings.EqualFold(t.To.Name, toStatus) && !strings.EqualFold(t.Name, toStatus) {
+			continue
+		}
+		payload := map[string]any{"transition": map[string]string{"id": t.ID}}
+		if _, ok := t.Fields["resolution"]; ok && resolution != "" {
+			payload["fields"] = map[string]any{"resolution": map[string]string{"name": resolution}}
+		}
+		if err := c.jsonDo(ctx, "transition", http.MethodPost, base+"/transitions", payload, nil, http.StatusNoContent); err != nil {
+			return "", err
+		}
+		return t.To.Name, nil
+	}
+	return "", fmt.Errorf("jira transition %s: no transition to %q from %q (available: %s)",
+		key, toStatus, cur.Fields.Status.Name, strings.Join(names, ", "))
+}
+
+// AssignToReporter assigns the issue to its reporter and returns the reporter's display name.
+func (c *Client) AssignToReporter(ctx context.Context, key string) (string, error) {
+	base := "/rest/api/2/issue/" + url.PathEscape(key)
+	var is struct {
+		Fields struct {
+			Reporter *struct {
+				Name        string `json:"name"`
+				DisplayName string `json:"displayName"`
+			} `json:"reporter"`
+		} `json:"fields"`
+	}
+	if err := c.jsonDo(ctx, "get reporter", http.MethodGet, base+"?fields=reporter", nil, &is, http.StatusOK); err != nil {
+		return "", err
+	}
+	r := is.Fields.Reporter
+	if r == nil || r.Name == "" {
+		return "", fmt.Errorf("jira assign %s: issue has no reporter", key)
+	}
+	if err := c.jsonDo(ctx, "assign", http.MethodPut, base+"/assignee", map[string]string{"name": r.Name}, nil, http.StatusNoContent); err != nil {
+		return "", err
+	}
+	return r.DisplayName, nil
+}

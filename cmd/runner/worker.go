@@ -72,7 +72,16 @@ func runWorker(log *slog.Logger, once, noPush bool, publishJob int64) error {
 	}
 	if !noPush {
 		w.MR = gitlab.New(wcfg.GitLabBaseURL, wcfg.GitLabToken)
-		w.Comment = jc // Jira comment only when a Draft MR is opened
+		w.Comment = jc  // Jira comment once an MR exists, and on handover
+		w.Resolver = jc // resolve + back to reporter after a successful handover
+		w.Handover = worker.HandoverConfig{
+			MinTickets:   wcfg.HandoverMinTickets,
+			PollEvery:    wcfg.PipelinePoll,
+			StartTimeout: wcfg.PipelineStartTimeout,
+			Timeout:      cfg.PipelineTimeout,
+			JiraStatus:   wcfg.JiraHandoverStatus,
+			Resolution:   wcfg.JiraResolution,
+		}
 	}
 
 	log.Info("worker starting", "once", once, "no_push", noPush, "db", cfg.DBPath,

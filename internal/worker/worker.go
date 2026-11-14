@@ -38,17 +38,52 @@ type Messenger interface {
 	EditMessage(ctx context.Context, chatID, messageID int64, html string, kb telegram.Keyboard) error
 }
 
-// MRRequest describes the merge request to open for a finished job.
+// MRRequest describes a merge request to open.
 type MRRequest struct {
 	Repo         repos.Repo
 	SourceBranch string
+	Target       string // empty = Repo.BaseBranch
 	Title        string
 	Description  string
+	Draft        bool
+	KeepSource   bool // never delete the source branch (handover MRs from the shared dev branch)
 }
 
-// MROpener opens a draft merge request and returns its web URL.
-type MROpener interface {
-	OpenDraftMR(ctx context.Context, r MRRequest) (string, error)
+// MR identifies an opened merge request.
+type MR struct {
+	IID    int64
+	WebURL string
+}
+
+// Pipeline is a CI/CD pipeline's status (created, pending, running, success, failed, canceled, skipped, manual…).
+type Pipeline struct {
+	ID     int64
+	Status string
+	WebURL string
+}
+
+// PipelineJob is a failed CI/CD job.
+type PipelineJob struct {
+	ID                                 int64
+	Name, Stage, WebURL, FailureReason string
+}
+
+// GitLab is the code-host surface the worker needs.
+type GitLab interface {
+	OpenMR(ctx context.Context, r MRRequest) (MR, error)
+	FindOpenMR(ctx context.Context, project, source, target string) (MR, bool, error)
+	ApproveMR(ctx context.Context, project string, iid int64) error
+	MergeMR(ctx context.Context, project string, iid int64, removeSource bool) (string, error)
+	FindPipeline(ctx context.Context, project, ref, sha string) (Pipeline, bool, error)
+	GetPipeline(ctx context.Context, project string, id int64) (Pipeline, error)
+	FailedJobs(ctx context.Context, project string, pipelineID int64) ([]PipelineJob, error)
+	JobLogTail(ctx context.Context, project string, jobID int64, lines int) (string, error)
+}
+
+// Resolver moves a delivered Jira issue on: workflow transition + back to the reporter.
+type Resolver interface {
+	Transition(ctx context.Context, key, toStatus, resolution string) (string, error)
+	AssignToReporter(ctx context.Context, key string) (string, error)
 }
 
 // Worker runs agent jobs one at a time.
@@ -58,8 +93,10 @@ type Worker struct {
 	Jira        IssueGetter
 	TG          Messenger
 	ChatID      int64
-	MR          MROpener  // nil or NoPush → commit locally only
-	Comment     Commenter // optional: comment on the Jira issue once a Draft MR exists
+	MR          GitLab    // nil or NoPush → commit locally only
+	Comment     Commenter // optional: comment on the Jira issue once an MR exists
+	Resolver    Resolver  // optional: resolve + reassign issues after a successful handover
+	Handover    HandoverConfig
 	NoPush      bool
 	Claude      agent.ClaudeSpec // Bin, MaxBudgetUSD, Model, Timeout; Dir/Prompt/Tools/LogPath set per job
 	TestTimeout time.Duration
@@ -73,7 +110,9 @@ type Worker struct {
 	Log             *slog.Logger
 }
 
-// Run recovers orphaned jobs, then processes the queue until ctx is done.
+// Run recovers orphaned jobs, then processes the queue until ctx is done. Approved handovers
+// run before the next job; a handover is proposed only when the queue is idle; CI/CD of
+// deployed handovers is watched in the background.
 func (w *Worker) Run(ctx context.Context) error {
 	if err := w.recover(ctx); err != nil {
 		return err
@@ -82,13 +121,25 @@ func (w *Worker) Run(ctx context.Context) error {
 	if every <= 0 {
 		every = 10 * time.Second
 	}
+	handover := w.MR != nil && !w.NoPush
+	if handover {
+		go w.watchLoop(ctx)
+	}
 	for ctx.Err() == nil {
+		if handover {
+			w.runApprovedHandover(ctx)
+		}
 		did, err := w.RunOnce(ctx)
 		if err != nil && ctx.Err() == nil {
 			w.Log.Error("worker", "err", err)
 		}
 		if did {
 			continue
+		}
+		if handover {
+			if err := w.proposeHandover(ctx); err != nil && ctx.Err() == nil {
+				w.Log.Error("propose handover", "err", err)
+			}
 		}
 		t := time.NewTimer(every)
 		select {
@@ -215,13 +266,11 @@ func (w *Worker) process(ctx context.Context, log *slog.Logger, job store.Job, r
 		return fail("agent made no changes")
 	}
 
-	var tests *agent.TestRun
 	if repo.TestCmd != "" {
 		tr, err := agent.RunTests(ctx, wt.Dir, repo.TestCmd, filepath.Join(jobDir, "test.log"), w.TestTimeout)
 		if err != nil {
 			return fail("%v", err)
 		}
-		tests = &tr
 		rep.Tests = &tr
 		res.TestsPassed = &tr.Passed
 		log.Info("tests done", "passed", tr.Passed, "exit", tr.ExitCode)
@@ -239,18 +288,62 @@ func (w *Worker) process(ctx context.Context, log *slog.Logger, job store.Job, r
 	if err := wt.Push(ctx); err != nil {
 		return fail("push: %v", err)
 	}
-	url, err := w.MR.OpenDraftMR(ctx, MRRequest{
+	if err := w.openAndMerge(ctx, log, issue, repo, branch, rep, &res); err != nil {
+		return fail("%v", err)
+	}
+	return res, ""
+}
+
+// mergeGate decides whether a fix may go straight into the shared base branch:
+// the repo opted in, tests ran and passed, and E2E (when configured) is complete.
+func mergeGate(repo repos.Repo, tests *agent.TestRun, ev *Evidence) (bool, string) {
+	switch {
+	case !repo.AutoMerge:
+		return false, "auto_merge is off for this repo"
+	case tests == nil:
+		return false, "no test_cmd: tests not run"
+	case !tests.Passed:
+		return false, "tests failed"
+	case repo.E2E != nil && (ev == nil || !ev.Complete()):
+		return false, "E2E not complete"
+	}
+	return true, ""
+}
+
+// openAndMerge opens the MR for a pushed branch: a Draft MR when the gate fails, otherwise
+// a ready MR that is approved and merged into base_branch (the job then waits for handover).
+// A failed merge leaves the MR open and is reported, not treated as a job failure.
+func (w *Worker) openAndMerge(ctx context.Context, log *slog.Logger, issue jira.IssueDetail, repo repos.Repo, branch string, rep *Report, res *store.JobResult) error {
+	ok, why := mergeGate(repo, rep.Tests, rep.Evidence)
+	rep.MergeNote = why
+	mr, err := w.MR.OpenMR(ctx, MRRequest{
 		Repo:         repo,
 		SourceBranch: branch,
-		Title:        fmt.Sprintf("Draft: [%s] %s", issue.Key, issue.Summary),
-		Description:  mrDescription(issue, repo, cr, tests, rep.Evidence, stat),
+		Title:        fmt.Sprintf("[%s] %s", issue.Key, issue.Summary),
+		Description:  mrDescription(issue, repo, rep.Agent, rep.Tests, rep.Evidence, rep.DiffStat, ok),
+		Draft:        !ok,
 	})
 	if err != nil {
-		return fail("open MR: %v", err)
+		return fmt.Errorf("open MR: %w", err)
 	}
-	res.MRURL = url
-	rep.MRURL = url
-	return res, ""
+	res.MRURL, res.MRIID = mr.WebURL, mr.IID
+	rep.MRURL = mr.WebURL
+	if !ok {
+		return nil
+	}
+	if err := w.MR.ApproveMR(ctx, repo.GitLabProject, mr.IID); err != nil {
+		log.Warn("approve MR (merging anyway)", "err", err)
+	}
+	sha, err := w.MR.MergeMR(ctx, repo.GitLabProject, mr.IID, true)
+	if err != nil {
+		log.Warn("auto-merge failed; MR left open", "err", err)
+		rep.MergeNote = "merge failed: " + err.Error()
+		return nil
+	}
+	res.MergedSHA = sha
+	rep.Merged = true
+	log.Info("merged into base branch", "branch", repo.BaseBranch, "sha", sha)
+	return nil
 }
 
 // updateNotice re-renders the task's latest notice with the job's progress.
@@ -278,10 +371,14 @@ func commitMessage(d jira.IssueDetail) string {
 	return fmt.Sprintf("fix(%s): %s\n\nJira: %s\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n", d.Key, d.Summary, d.URL)
 }
 
-func mrDescription(d jira.IssueDetail, repo repos.Repo, cr agent.ClaudeResult, tests *agent.TestRun, ev *Evidence, stat string) string {
+func mrDescription(d jira.IssueDetail, repo repos.Repo, cr agent.ClaudeResult, tests *agent.TestRun, ev *Evidence, stat string, autoMerge bool) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Jira: [%s](%s) — %s\n\n", d.Key, d.URL, d.Summary)
-	b.WriteString("> 🤖 Generated by jira-agent-runner with Claude Code. Review carefully before marking ready.\n\n")
+	if autoMerge {
+		fmt.Fprintf(&b, "> 🤖 Generated by jira-agent-runner with Claude Code. Tests and E2E passed: auto-merged into `%s`; handed over after confirmation on Telegram.\n\n", repo.BaseBranch)
+	} else {
+		b.WriteString("> 🤖 Generated by jira-agent-runner with Claude Code. Review carefully before marking ready.\n\n")
+	}
 	switch {
 	case tests == nil:
 		b.WriteString("**Tests:** ⚠️ no `test_cmd` configured — not run\n\n")

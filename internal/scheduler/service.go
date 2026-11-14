@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"sync"
 	"time"
 
@@ -30,12 +31,14 @@ type Service struct {
 	SnoozeChoices []time.Duration
 	Repos         repos.Config // candidate repos per Jira project for "Fix it"
 	PollInterval  time.Duration
-	RemindAfter   time.Duration // re-remind notified tasks untouched this long
-	RemindCheck   time.Duration // how often due reminders are checked (default 1m)
-	SendGap       time.Duration // pause between outgoing messages (Telegram: ~1 msg/s per chat)
-	Heartbeat     func()        // optional; called each loop tick to prove the main loop is alive
-	Now           func() time.Time
-	Log           *slog.Logger
+	RemindAfter   time.Duration // re-remind notified tasks untouched this long; also "later" for handovers
+	// HandoverTimeout bounds CI/CD watching after "watch again" (default 90m).
+	HandoverTimeout time.Duration
+	RemindCheck     time.Duration // how often due reminders are checked (default 1m)
+	SendGap         time.Duration // pause between outgoing messages (Telegram: ~1 msg/s per chat)
+	Heartbeat       func()        // optional; called each loop tick to prove the main loop is alive
+	Now             func() time.Time
+	Log             *slog.Logger
 
 	mu sync.Mutex // serializes read-modify-edit of a task's message
 }
@@ -249,6 +252,11 @@ func (s *Service) handleCallback(ctx context.Context, q *telegram.CallbackQuery)
 		return
 	}
 	msgID := q.Message.MessageID
+	switch cb.Action {
+	case telegram.ActHandoverYes, telegram.ActHandoverLater, telegram.ActHandoverRewatch:
+		answer(s.handleHandover(ctx, cb, msgID))
+		return
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -414,4 +422,55 @@ func (s *Service) RefreshApproved(ctx context.Context) {
 		}
 		s.withLock(func() { s.refresh(ctx, t, t.TGMessageID) })
 	}
+}
+
+// handleHandover applies a handover button; the worker does the GitLab/Jira work.
+// Returns the toast text.
+func (s *Service) handleHandover(ctx context.Context, cb telegram.Callback, msgID int64) string {
+	id, err := strconv.ParseInt(cb.Key, 10, 64)
+	if err != nil {
+		return "Unknown handover"
+	}
+	now := s.Now()
+	var (
+		h      store.Handover
+		footer string
+		toast  string
+	)
+	switch cb.Action {
+	case telegram.ActHandoverYes:
+		h, err = s.Store.DecideHandover(ctx, id, true, time.Time{}, now)
+		footer, toast = "\n\n✅ <b>Đã đồng ý</b> "+now.Format("15:04")+" — worker đang tạo MR sang test…", "🚀 OK, đang bàn giao"
+	case telegram.ActHandoverLater:
+		at := now.Add(s.RemindAfter)
+		h, err = s.Store.DecideHandover(ctx, id, false, at, now)
+		footer, toast = "\n\n⏰ <b>Để sau</b> — sẽ hỏi lại sau "+at.Format("15:04 02/01"), "⏰ Sẽ hỏi lại sau"
+	case telegram.ActHandoverRewatch:
+		timeout := s.HandoverTimeout
+		if timeout <= 0 {
+			timeout = 90 * time.Minute
+		}
+		if _, err = s.Store.RewatchHandover(ctx, id, now.Add(timeout), now); err == nil {
+			if err := s.TG.EditMessage(ctx, s.ChatID, msgID, "🔁 Đang theo dõi lại CI/CD của lần bàn giao #"+cb.Key+"…", nil); err != nil {
+				s.Log.Warn("edit handover report", "err", err)
+			}
+			return "🔁 Đang theo dõi lại"
+		}
+	}
+	switch {
+	case errors.Is(err, store.ErrHandoverState):
+		return "Đã xử lý rồi"
+	case store.IsNotFound(err):
+		return "Handover not found"
+	case err != nil:
+		s.Log.Error("handover callback", "id", id, "err", err)
+		return "Error, try again"
+	}
+	if h.Message != "" {
+		if err := s.TG.EditMessage(ctx, s.ChatID, msgID, h.Message+footer, nil); err != nil && !telegram.IsNotModified(err) {
+			s.Log.Warn("edit handover question", "err", err)
+		}
+	}
+	s.Log.Info("handover decided", "id", id, "status", h.Status)
+	return toast
 }
