@@ -39,10 +39,34 @@ func Load(path string) (Config, error) {
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	for _, list := range c {
+		for i := range list {
+			list[i].GitLabProject = NormalizeProject(list[i].GitLabProject)
+		}
+	}
 	if err := c.validate(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return c, nil
+}
+
+// NormalizeProject turns a clone URL into the GitLab project path the API expects:
+// "git@host:group/app.git", "ssh://git@host:22/group/app.git" and
+// "https://host/group/app.git" all become "group/app". A plain path is kept.
+func NormalizeProject(p string) string {
+	p = strings.TrimSpace(p)
+	switch {
+	case strings.Contains(p, "://"):
+		_, rest, _ := strings.Cut(p, "://")
+		if _, path, ok := strings.Cut(rest, "/"); ok {
+			p = path
+		}
+	case strings.HasPrefix(p, "git@") || (strings.Contains(p, "@") && strings.Contains(p, ":")):
+		if _, path, ok := strings.Cut(p, ":"); ok {
+			p = path
+		}
+	}
+	return strings.Trim(strings.TrimSuffix(p, ".git"), "/")
 }
 
 func (c Config) validate() error {

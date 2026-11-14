@@ -60,3 +60,18 @@ func TestLoadValidation(t *testing.T) {
 		t.Error("unknown field should fail")
 	}
 }
+
+func TestNormalizeProject(t *testing.T) {
+	cases := map[string]string{
+		"git@192.168.2.181:dsb/DSBNova/cd-host-job.git":          "dsb/DSBNova/cd-host-job",
+		"ssh://git@gitlab.example.com:2222/group/app.git":        "group/app",
+		"https://devx.navisoft.com.vn/dsb/DSBNova/cd-x-host.git": "dsb/DSBNova/cd-x-host",
+		"group/sub/app":  "group/sub/app",
+		"/group/app.git": "group/app",
+	}
+	for in, want := range cases {
+		if got := NormalizeProject(in); got != want {
+			t.Errorf("NormalizeProject(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
