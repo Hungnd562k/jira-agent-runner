@@ -1,0 +1,24 @@
+services:
+  runner:
+    build: .
+    image: jira-agent-runner:local
+    container_name: jira-agent-runner
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_PATH: /data/tasks.db # overrides the host path from .env
+    # Run as the host user so the bind-mounted ./data stays writable/owned by you.
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - ./data:/data
+    mem_limit: 64m
+    cpus: 0.25
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "3"

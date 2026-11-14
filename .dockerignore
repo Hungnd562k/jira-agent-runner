@@ -1,0 +1,8 @@
+.git
+.gitnexus
+.claude
+.env
+data
+bin
+docs
+*.md
