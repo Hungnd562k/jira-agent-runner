@@ -100,3 +100,18 @@ func lastLines(s string, n int) string {
 	}
 	return strings.Join(lines, "\n")
 }
+
+// CopyIgnoredFiles copies the named files from src to dst when they exist in src and are
+// absent in dst (e.g. git-ignored CLAUDE.md that a fresh worktree does not have).
+// Being ignored, they are never picked up by `git add -A`.
+func CopyIgnoredFiles(src, dst string, names ...string) {
+	for _, n := range names {
+		to := filepath.Join(dst, n)
+		if _, err := os.Stat(to); err == nil {
+			continue
+		}
+		if b, err := os.ReadFile(filepath.Join(src, n)); err == nil {
+			_ = os.WriteFile(to, b, 0o644)
+		}
+	}
+}

@@ -24,11 +24,10 @@ type WorkerConfig struct {
 
 // LoadWorker reads worker settings. GitLab settings are required unless requireGitLab is false (--no-push).
 func LoadWorker(requireGitLab bool) (*WorkerConfig, error) {
-	home, _ := os.UserHomeDir()
 	w := &WorkerConfig{
 		GitLabBaseURL: os.Getenv("GITLAB_BASE_URL"),
 		GitLabToken:   os.Getenv("GITLAB_TOKEN"),
-		WorktreeDir:   getenv("WORKTREE_DIR", filepath.Join(home, ".cache", "jira-agent-runner", "worktrees")),
+		WorktreeDir:   os.Getenv("WORKTREE_DIR"), // empty = next to each repo clone
 		ClaudeBin:     getenv("CLAUDE_BIN", "claude"),
 		AgentModel:    os.Getenv("AGENT_MODEL"),
 	}
@@ -43,7 +42,7 @@ func LoadWorker(requireGitLab bool) (*WorkerConfig, error) {
 	if w.AgentMaxBudgetUSD, err = strconv.ParseFloat(getenv("AGENT_MAX_BUDGET_USD", "5"), 64); err != nil || w.AgentMaxBudgetUSD < 0 {
 		errs = append(errs, fmt.Errorf("AGENT_MAX_BUDGET_USD must be a number >= 0"))
 	}
-	if !filepath.IsAbs(w.WorktreeDir) {
+	if w.WorktreeDir != "" && !filepath.IsAbs(w.WorktreeDir) {
 		errs = append(errs, fmt.Errorf("WORKTREE_DIR must be absolute, got %q", w.WorktreeDir))
 	}
 	if requireGitLab {

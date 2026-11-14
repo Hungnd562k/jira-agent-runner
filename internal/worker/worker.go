@@ -150,10 +150,13 @@ func (w *Worker) process(ctx context.Context, log *slog.Logger, job store.Job) (
 	}
 
 	branch := fmt.Sprintf("agent/%s-j%d", job.JiraKey, job.ID)
-	wt, err := agent.NewWorktree(ctx, repo.Path, w.WorktreeRoot, fmt.Sprintf("%s-j%d", job.JiraKey, job.ID), branch, repo.BaseBranch)
+	root, name := worktreeLocation(w.WorktreeRoot, repo.Path, job)
+	wt, err := agent.NewWorktree(ctx, repo.Path, root, name, branch, repo.BaseBranch)
 	if err != nil {
 		return fail("prepare worktree: %v", err)
 	}
+	// Git-ignored agent guidance (CLAUDE.md/AGENTS.md) only exists in the main clone.
+	agent.CopyIgnoredFiles(repo.Path, wt.Dir, "CLAUDE.md", "AGENTS.md", "CLAUDE.local.md")
 	defer func() {
 		if err := wt.Remove(context.WithoutCancel(ctx)); err != nil {
 			log.Warn("remove worktree", "err", err)
@@ -272,4 +275,15 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+// worktreeLocation picks where a job's worktree lives. With no explicit root it sits next to
+// the main clone (same directory depth), so relative references to sibling repos such as
+// ../../other-repo/x.csproj resolve exactly as they do in the main clone.
+func worktreeLocation(root, repoPath string, job store.Job) (dir, name string) {
+	name = fmt.Sprintf("%s-j%d", job.JiraKey, job.ID)
+	if root != "" {
+		return root, name
+	}
+	return filepath.Dir(repoPath), ".agent-" + filepath.Base(repoPath) + "-" + name
 }

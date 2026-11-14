@@ -81,7 +81,7 @@ Runs where `claude` (logged in), git SSH credentials and repo toolchains exist; 
 
 Pipeline per job:
 1. `GetIssue` (summary, description, type, priority, components, labels, last 5 comments).
-2. `git fetch origin <base>` → `git worktree add -b agent/<KEY>-j<jobid> <WORKTREE_DIR>/<KEY>-j<jobid> origin/<base>`.
+2. `git fetch origin <base>` → `git worktree add -b agent/<KEY>-j<jobid> <dir> origin/<base>`, where `<dir>` defaults to `<parent of repo path>/.agent-<repo>-<KEY>-j<jobid>` (same depth as the clone, so relative references to sibling repos like `../../other-repo/x.csproj` resolve) or `<WORKTREE_DIR>/<KEY>-j<jobid>` when set. Git-ignored `CLAUDE.md`/`AGENTS.md`/`CLAUDE.local.md` are copied from the clone so the agent gets project guidance (never committed).
 3. `claude -p` (prompt on stdin) `--output-format json --permission-mode acceptEdits --allowedTools Read Edit Write Glob Grep Bash(git diff:*) Bash(git status:*) Bash(git log:*) <repo allowed_tools> --max-budget-usd <AGENT_MAX_BUDGET_USD> [--model]`, timeout `AGENT_TIMEOUT` (kills the process group). The agent must not commit/push. Raw output: `data/jobs/<id>/agent.json`.
 4. No changes → `failed: agent made no changes` (agent's explanation sent as a reply).
 5. The worker runs `test_cmd` itself (`sh -c`, timeout `TEST_TIMEOUT`) → `data/jobs/<id>/test.log`; failing tests do not abort.
@@ -89,4 +89,4 @@ Pipeline per job:
 7. `--no-push`: stop here (branch kept locally). Otherwise `git push -u origin <branch>` and `POST /api/v4/projects/<path>/merge_requests` with title `Draft: [<KEY>] <summary>`, target `base_branch`, `remove_source_branch`, description = Jira link, test result (❌ = do not merge), agent report, diff stat, test log tail.
 8. Worktree removed (branch kept); job + notice updated (`Done … Draft MR · tests ✅/❌` or `Failed: …`).
 
-Worker env: `GITLAB_BASE_URL`, `GITLAB_TOKEN` (`api` scope; required unless `--no-push`), `WORKTREE_DIR` (`~/.cache/jira-agent-runner/worktrees`), `CLAUDE_BIN` (`claude`), `AGENT_TIMEOUT` (`30m`), `AGENT_MAX_BUDGET_USD` (`5`), `AGENT_MODEL`, `TEST_TIMEOUT` (`15m`). Run with `make worker-local` (no push) / `make worker`, or the systemd user unit in `deploy/`.
+Worker env: `GITLAB_BASE_URL`, `GITLAB_TOKEN` (`api` scope; required unless `--no-push`), `WORKTREE_DIR` (empty = next to each clone), `CLAUDE_BIN` (`claude`), `AGENT_TIMEOUT` (`30m`), `AGENT_MAX_BUDGET_USD` (`5`), `AGENT_MODEL`, `TEST_TIMEOUT` (`15m`). Run with `make worker-local` (no push) / `make worker`, or the systemd user unit in `deploy/`.

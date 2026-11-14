@@ -213,3 +213,34 @@ func TestRecoverOrphans(t *testing.T) {
 		t.Fatalf("job = %+v edits = %v", job, tg.edits)
 	}
 }
+
+func TestWorktreeNextToRepoSeesSiblingsAndIgnoredGuidance(t *testing.T) {
+	ctx := context.Background()
+	// The fake agent fails unless the ignored CLAUDE.md was copied and ../sibling resolves.
+	w, _, clone, _ := setup(t, "test -f CLAUDE.md || exit 3\ntest -f ../sibling/marker || exit 4\n"+okClaude)
+	w.NoPush = true
+	w.WorktreeRoot = "" // default: next to the clone
+
+	root := filepath.Dir(clone)
+	os.MkdirAll(filepath.Join(root, "sibling"), 0o755)
+	os.WriteFile(filepath.Join(root, "sibling", "marker"), nil, 0o644)
+	os.WriteFile(filepath.Join(clone, ".gitignore"), []byte("CLAUDE.md\n"), 0o644)
+	git(t, clone, "add", ".gitignore")
+	git(t, clone, "commit", "-m", "ignore")
+	git(t, clone, "push", "origin", "HEAD:main")
+	os.WriteFile(filepath.Join(clone, "CLAUDE.md"), []byte("rules"), 0o644)
+
+	if _, err := w.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	job, _ := w.Store.LatestJob(ctx, "X-1")
+	if job.Status != store.JobSucceeded {
+		t.Fatalf("job = %+v", job)
+	}
+	if files := git(t, clone, "show", "--name-only", "--format=", job.Branch); strings.Contains(files, "CLAUDE.md") {
+		t.Errorf("ignored CLAUDE.md was committed: %s", files)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".agent-clone-X-1-j1")); !os.IsNotExist(err) {
+		t.Errorf("sibling worktree not removed: %v", err)
+	}
+}
