@@ -22,7 +22,7 @@ import (
 )
 
 // runWorker processes approved agent jobs on the host (needs claude, git credentials, toolchains).
-func runWorker(log *slog.Logger, once, noPush bool) error {
+func runWorker(log *slog.Logger, once, noPush bool, publishJob int64) error {
 	cfg, err := config.Load(true)
 	if err != nil {
 		return fmt.Errorf("invalid configuration: %w", err)
@@ -77,6 +77,9 @@ func runWorker(log *slog.Logger, once, noPush bool) error {
 		"repos_projects", len(repoCfg), "worktrees", wcfg.WorktreeDir, "agent_timeout", wcfg.AgentTimeout,
 		"max_budget_usd", wcfg.AgentMaxBudgetUSD)
 
+	if publishJob > 0 {
+		return w.Publish(ctx, publishJob)
+	}
 	if once {
 		did, err := w.RunOnce(ctx)
 		if err == nil && !did {

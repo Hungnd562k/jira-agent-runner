@@ -32,6 +32,7 @@ func main() {
 	healthcheck := flag.Bool("healthcheck", false, "exit 0 if the running service's heartbeat is fresh (for Docker HEALTHCHECK)")
 	workerMode := flag.Bool("worker", false, "run the agent worker (on the host): process approved jobs instead of polling Jira")
 	noPush := flag.Bool("no-push", false, "worker: commit on a local branch only; do not push or open a merge request")
+	publishJob := flag.Int64("publish-job", 0, "worker: push + open the Draft MR for an existing job whose agent run succeeded but push/MR failed, then exit")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -46,7 +47,7 @@ func main() {
 	}
 	run := func() error { return run(log, *once, *dryRun) }
 	if *workerMode {
-		run = func() error { return runWorker(log, *once, *noPush) }
+		run = func() error { return runWorker(log, *once, *noPush, *publishJob) }
 	}
 	if err := run(); err != nil {
 		log.Error("fatal", "err", err)

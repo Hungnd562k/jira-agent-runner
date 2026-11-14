@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -39,10 +40,16 @@ func (f *fakeTG) EditMessage(_ context.Context, _, _ int64, html string, _ teleg
 	return nil
 }
 
-type fakeMR struct{ req *MRRequest }
+type fakeMR struct {
+	req *MRRequest
+	err error
+}
 
 func (f *fakeMR) OpenDraftMR(_ context.Context, r MRRequest) (string, error) {
 	f.req = &r
+	if f.err != nil {
+		return "", f.err
+	}
 	return "https://gitlab/mr/1", nil
 }
 
@@ -284,5 +291,45 @@ func TestReportPublished(t *testing.T) {
 	}
 	if jc2.key != "X-1" || !strings.Contains(jc2.body, "https://gitlab/mr/1") || !strings.Contains(jc2.body, "(/)") {
 		t.Fatalf("jira comment = %+v", jc2)
+	}
+}
+
+func TestPublishAfterMRFailure(t *testing.T) {
+	ctx := context.Background()
+	w, tg, _, origin := setup(t, okClaude)
+	mr := &fakeMR{err: errors.New("gitlab create MR: HTTP 403: insufficient_scope")}
+	w.MR = mr
+	jc := &fakeComment{}
+	w.Comment = jc
+
+	w.RunOnce(ctx)
+	job, _ := w.Store.LatestJob(ctx, "X-1")
+	if job.Status != store.JobFailed || !strings.Contains(job.Error, "insufficient_scope") {
+		t.Fatalf("job = %+v", job)
+	}
+	// Failure after a commit still reports where the work is.
+	if len(tg.sends) != 1 || !strings.Contains(tg.sends[0], "Failed at") || !strings.Contains(tg.sends[0], "agent/X-1-j1") {
+		t.Fatalf("failure report = %v", tg.sends)
+	}
+
+	mr.err = nil // token fixed
+	if err := w.Publish(ctx, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	job, _ = w.Store.LatestJob(ctx, "X-1")
+	if job.Status != store.JobSucceeded || job.MRURL != "https://gitlab/mr/1" || job.TestsPassed == nil || !*job.TestsPassed {
+		t.Fatalf("published job = %+v", job)
+	}
+	if !strings.Contains(mr.req.Description, "Root cause") || !strings.Contains(mr.req.Description, "✅") {
+		t.Errorf("MR description = %q", mr.req.Description)
+	}
+	if jc.key != "X-1" || !strings.Contains(jc.body, "https://gitlab/mr/1") {
+		t.Errorf("jira comment = %+v", jc)
+	}
+	if out := git(t, origin, "branch", "--list", "agent/X-1-j1"); out == "" {
+		t.Error("branch missing on origin")
+	}
+	if err := w.Publish(ctx, job.ID); err == nil {
+		t.Error("second publish should refuse (MR exists)")
 	}
 }

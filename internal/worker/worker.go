@@ -311,9 +311,15 @@ func (w *Worker) publish(ctx context.Context, log *slog.Logger, j store.Job, rep
 	if err := os.WriteFile(filepath.Join(rep.JobDir, "report.md"), []byte(rep.Markdown(j)), 0o644); err != nil {
 		log.Warn("write report", "err", err)
 	}
-	if j.Status == store.JobSucceeded {
-		w.reply(ctx, j.JiraKey, rep.Telegram())
+	if j.Status == store.JobFailed && rep.DiffStat == "" {
+		return // nothing was committed; the failure reply already explains it
 	}
+	text := rep.Telegram()
+	if j.Status == store.JobFailed {
+		// The agent ran (and maybe pushed): say where the work is and which step failed.
+		text = "⚠️ <b>Failed at:</b> " + html.EscapeString(truncate(j.Error, 300)) + "\n" + text
+	}
+	w.reply(ctx, j.JiraKey, text)
 	if rep.MRURL != "" && w.Comment != nil {
 		if err := w.Comment.AddComment(ctx, j.JiraKey, rep.JiraComment()); err != nil {
 			log.Warn("jira comment", "err", err)
