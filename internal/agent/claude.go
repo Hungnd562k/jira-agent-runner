@@ -33,6 +33,8 @@ type ClaudeSpec struct {
 	Model        string   // optional
 	Timeout      time.Duration
 	LogPath      string // raw JSON output is written here
+	// OnStart, when set, receives the agent's PID (= its process group id) right after start.
+	OnStart func(pgid int)
 }
 
 // ClaudeResult is the parsed `--output-format json` result.
@@ -93,7 +95,13 @@ func RunClaude(ctx context.Context, spec ClaudeSpec) (ClaudeResult, error) {
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	runErr := cmd.Run()
+	runErr := cmd.Start()
+	if runErr == nil {
+		if spec.OnStart != nil {
+			spec.OnStart(cmd.Process.Pid)
+		}
+		runErr = cmd.Wait()
+	}
 	// Reap anything the agent left running in its group (e.g. a local app server started for E2E),
 	// so the next job finds the port free.
 	if cmd.Process != nil {
@@ -122,6 +130,27 @@ func RunClaude(ctx context.Context, spec ClaudeSpec) (ClaudeResult, error) {
 		return res, fmt.Errorf("agent error (%s): %s", reason, firstLine(res.Text))
 	}
 	return res, nil
+}
+
+// BootID identifies the current host boot (Linux); "" when unknown. A process group id is
+// only meaningful within the boot that recorded it.
+func BootID() string {
+	b, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// KillGroup SIGKILLs a process group; a group that no longer exists is not an error.
+func KillGroup(pgid int) error {
+	if pgid <= 1 {
+		return nil
+	}
+	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return err
+	}
+	return nil
 }
 
 // lastJSON returns the last top-level JSON object line of out (tolerates leading noise).

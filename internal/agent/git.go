@@ -87,6 +87,72 @@ func (w *Worktree) Push(ctx context.Context) error {
 	return err
 }
 
+// SaveWIP commits whatever the agent left uncommitted (a failed or interrupted run) so it
+// survives the worktree's removal; the commit stays on the local branch and is never pushed.
+// sha is "" when there was nothing to save.
+func (w *Worktree) SaveWIP(ctx context.Context, message string) (sha string, err error) {
+	changed, err := w.HasChanges(ctx)
+	if err != nil || !changed {
+		return "", err
+	}
+	if err := w.Commit(ctx, message); err != nil {
+		return "", err
+	}
+	return w.Git().Run(ctx, "rev-parse", "HEAD")
+}
+
+// ApplyWIP brings a saved WIP commit back as uncommitted changes, on top of the current
+// HEAD (the fresh base) when it applies cleanly, otherwise on the base it was made from.
+func (w *Worktree) ApplyWIP(ctx context.Context, sha string) error {
+	g := w.Git()
+	if _, err := g.Run(ctx, "cherry-pick", "--no-commit", sha); err == nil {
+		_, err = g.Run(ctx, "reset", "--quiet") // unstage: the agent sees plain local edits
+		return err
+	}
+	_, _ = g.Run(ctx, "cherry-pick", "--abort")
+	_, _ = g.Run(ctx, "reset", "--hard", "--quiet")
+	if _, err := g.Run(ctx, "reset", "--hard", "--quiet", sha+"^"); err != nil {
+		return err
+	}
+	if _, err := g.Run(ctx, "cherry-pick", "--no-commit", sha); err != nil {
+		return err
+	}
+	_, err := g.Run(ctx, "reset", "--quiet")
+	return err
+}
+
+// ListedWorktree is one entry of `git worktree list --porcelain`.
+type ListedWorktree struct {
+	Dir    string
+	Branch string // short name, "" when detached
+}
+
+// Worktrees lists the linked worktrees of the repository (the main clone excluded).
+func (g Git) Worktrees(ctx context.Context) ([]ListedWorktree, error) {
+	out, err := g.Run(ctx, "worktree", "list", "--porcelain")
+	if err != nil {
+		return nil, err
+	}
+	var all []ListedWorktree
+	for _, block := range strings.Split(out, "\n\n") {
+		var wt ListedWorktree
+		for _, l := range strings.Split(block, "\n") {
+			if v, ok := strings.CutPrefix(l, "worktree "); ok {
+				wt.Dir = v
+			} else if v, ok := strings.CutPrefix(l, "branch refs/heads/"); ok {
+				wt.Branch = v
+			}
+		}
+		if wt.Dir != "" {
+			all = append(all, wt)
+		}
+	}
+	if len(all) > 0 {
+		all = all[1:] // the first entry is the main working tree
+	}
+	return all, nil
+}
+
 // Remove deletes the worktree directory; the branch (and its commit) is kept.
 func (w *Worktree) Remove(ctx context.Context) error {
 	_, err := w.Repo.Run(ctx, "worktree", "remove", "--force", w.Dir)

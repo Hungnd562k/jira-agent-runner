@@ -67,6 +67,10 @@ func runWorker(log *slog.Logger, once, noPush bool, publishJob int64) error {
 		NodePath:        wcfg.E2ENodePath,
 		WorktreeRoot:    wcfg.WorktreeDir,
 		JobsDir:         filepath.Join(filepath.Dir(cfg.DBPath), "jobs"),
+		AutoRetries:     wcfg.JobAutoRetries,
+		RetryDelay:      wcfg.JobRetryDelay,
+		GitNetTimeout:   wcfg.GitNetTimeout,
+		BootID:          agent.BootID(),
 		Now:             time.Now,
 		Log:             log,
 	}
@@ -86,7 +90,8 @@ func runWorker(log *slog.Logger, once, noPush bool, publishJob int64) error {
 
 	log.Info("worker starting", "once", once, "no_push", noPush, "db", cfg.DBPath,
 		"repos_projects", len(repoCfg), "worktrees", wcfg.WorktreeDir, "agent_timeout", wcfg.AgentTimeout,
-		"max_budget_usd", wcfg.AgentMaxBudgetUSD)
+		"max_budget_usd", wcfg.AgentMaxBudgetUSD, "auto_retries", wcfg.JobAutoRetries, "retry_delay", wcfg.JobRetryDelay,
+		"git_net_timeout", wcfg.GitNetTimeout)
 
 	if publishJob > 0 {
 		return w.Publish(ctx, publishJob)

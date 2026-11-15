@@ -106,8 +106,14 @@ type Worker struct {
 	WorktreeRoot    string
 	JobsDir         string // per-job logs: <JobsDir>/<id>/{agent.json,test.log}
 	PollEvery       time.Duration
-	Now             func() time.Time
-	Log             *slog.Logger
+	// Resilience: automatic retries of transient failures (network/API), with exponential
+	// backoff from RetryDelay; git fetch/push are bounded by GitNetTimeout.
+	AutoRetries   int
+	RetryDelay    time.Duration
+	GitNetTimeout time.Duration
+	BootID        string // agent.BootID(); lets a restarted worker reap an orphaned agent safely
+	Now           func() time.Time
+	Log           *slog.Logger
 }
 
 // Run recovers orphaned jobs, then processes the queue until ctx is done. Approved handovers
@@ -151,18 +157,6 @@ func (w *Worker) Run(ctx context.Context) error {
 	return nil
 }
 
-func (w *Worker) recover(ctx context.Context) error {
-	orphans, err := w.Store.FailOrphaned(ctx, w.Now())
-	if err != nil {
-		return err
-	}
-	for _, j := range orphans {
-		w.Log.Warn("orphaned job marked failed", "job", j.ID, "key", j.JiraKey)
-		w.updateNotice(ctx, j)
-	}
-	return nil
-}
-
 // RunOnce claims and processes one job. did=false when the queue was empty.
 func (w *Worker) RunOnce(ctx context.Context) (did bool, err error) {
 	job, ok, err := w.Store.ClaimJob(ctx, w.Now())
@@ -178,17 +172,28 @@ func (w *Worker) RunOnce(ctx context.Context) (did bool, err error) {
 	if res.Status == "" {
 		res.Status = store.JobSucceeded
 	}
+	stopped := ctx.Err() != nil && res.Status == store.JobFailed
+	if stopped {
+		res.Error = "interrupted (worker stopped): " + res.Error
+	}
 	// Persist the outcome even if ctx was cancelled mid-run.
 	done, ferr := w.Store.FinishJob(context.WithoutCancel(ctx), job.ID, res, w.Now())
 	if ferr != nil {
 		return true, ferr
 	}
 	log.Info("job finished", "status", done.Status, "mr", done.MRURL, "err", done.Error)
-	w.updateNotice(context.WithoutCancel(ctx), done)
-	if done.Status == store.JobFailed && detail != "" {
-		w.reply(context.WithoutCancel(ctx), done.JiraKey, "<pre>"+html.EscapeString(truncate(detail, 3000))+"</pre>")
+	bg := context.WithoutCancel(ctx)
+	w.updateNotice(bg, done)
+	if _, retried := w.maybeRetry(bg, log, done, stopped); retried {
+		return true, nil
 	}
-	w.publish(context.WithoutCancel(ctx), log, done, rep)
+	if done.Status == store.JobFailed && detail != "" {
+		w.reply(bg, done.JiraKey, "<pre>"+html.EscapeString(truncate(detail, 3000))+"</pre>")
+	}
+	if done.WIPSHA != "" {
+		w.reply(bg, done.JiraKey, wipText(done))
+	}
+	w.publish(bg, log, done, rep)
 	return true, nil
 }
 
@@ -216,14 +221,28 @@ func (w *Worker) process(ctx context.Context, log *slog.Logger, job store.Job, r
 
 	branch := fmt.Sprintf("agent/%s-j%d", job.JiraKey, job.ID)
 	root, name := worktreeLocation(w.WorktreeRoot, repo.Path, job)
-	wt, err := agent.NewWorktree(ctx, repo.Path, root, name, branch, repo.BaseBranch)
+	nctx, cancel := w.netCtx(ctx)
+	wt, err := agent.NewWorktree(nctx, repo.Path, root, name, branch, repo.BaseBranch)
+	err = netErr(nctx, err)
+	cancel()
 	if err != nil {
 		return fail("prepare worktree: %v", err)
 	}
 	// Git-ignored agent guidance (CLAUDE.md/AGENTS.md) only exists in the main clone.
 	agent.CopyIgnoredFiles(repo.Path, wt.Dir, "CLAUDE.md", "AGENTS.md", "CLAUDE.local.md")
 	defer func() {
-		if err := wt.Remove(context.WithoutCancel(ctx)); err != nil {
+		bg := context.WithoutCancel(ctx)
+		// A failed run keeps the agent's uncommitted edits as a local WIP commit, so a retry
+		// (automatic or manual) continues from them instead of starting over.
+		if res.Status == store.JobFailed {
+			if sha, err := wt.SaveWIP(bg, wipMessage(job, res.Error)); err != nil {
+				log.Warn("save wip", "err", err)
+			} else if sha != "" {
+				res.WIPSHA = sha
+				log.Info("partial work saved", "sha", shortSHA(sha))
+			}
+		}
+		if err := wt.Remove(bg); err != nil {
 			log.Warn("remove worktree", "err", err)
 		}
 	}()
@@ -235,7 +254,7 @@ func (w *Worker) process(ctx context.Context, log *slog.Logger, job store.Job, r
 	spec.Dir = wt.Dir
 	spec.AllowedTools = repo.AllowedTools
 	spec.LogPath = filepath.Join(jobDir, "agent.json")
-	task := agent.Task{TestCmd: repo.TestCmd}
+	task := agent.Task{TestCmd: repo.TestCmd, ResumeOf: w.resume(ctx, log, wt, job, repo.BaseBranch)}
 	if repo.E2E != nil {
 		e2e, err := w.prepareE2E(log, &spec, repo, jobDir)
 		if err != nil {
@@ -245,7 +264,12 @@ func (w *Worker) process(ctx context.Context, log *slog.Logger, job store.Job, r
 	}
 	spec.SystemPrompt = agent.Rules(task.E2E != nil)
 	spec.Prompt = agent.BuildPrompt(issue, task)
-	log.Info("agent running", "worktree", wt.Dir)
+	spec.OnStart = func(pgid int) {
+		if err := w.Store.SetJobAgent(context.WithoutCancel(ctx), job.ID, pgid, w.BootID); err != nil {
+			log.Warn("record agent pgid", "err", err)
+		}
+	}
+	log.Info("agent running", "worktree", wt.Dir, "resume_of", task.ResumeOf)
 	cr, err := agent.RunClaude(ctx, spec)
 	if err != nil {
 		return fail("%v", err)
@@ -285,13 +309,35 @@ func (w *Worker) process(ctx context.Context, log *slog.Logger, job store.Job, r
 		return res, ""
 	}
 
-	if err := wt.Push(ctx); err != nil {
+	pctx, cancel := w.netCtx(ctx)
+	err = netErr(pctx, wt.Push(pctx))
+	cancel()
+	if err != nil {
 		return fail("push: %v", err)
 	}
 	if err := w.openAndMerge(ctx, log, issue, repo, branch, rep, &res); err != nil {
 		return fail("%v", err)
 	}
 	return res, ""
+}
+
+// resume applies the WIP of the job this one continues; it returns that job's id, or 0 when
+// there is nothing (or nothing applicable) to continue — the agent then starts fresh.
+func (w *Worker) resume(ctx context.Context, log *slog.Logger, wt *agent.Worktree, job store.Job, base string) int64 {
+	if job.ResumeOf == 0 {
+		return 0
+	}
+	prev, err := w.Store.GetJob(ctx, job.ResumeOf)
+	if err != nil || prev.WIPSHA == "" {
+		return 0
+	}
+	if err := wt.ApplyWIP(ctx, prev.WIPSHA); err != nil {
+		log.Warn("apply wip; starting fresh", "from_job", prev.ID, "err", err)
+		_, _ = wt.Git().Run(ctx, "reset", "--hard", "--quiet", "origin/"+base)
+		return 0
+	}
+	log.Info("continuing partial work", "from_job", prev.ID, "sha", shortSHA(prev.WIPSHA))
+	return prev.ID
 }
 
 // mergeGate decides whether a fix may go straight into the shared base branch:
