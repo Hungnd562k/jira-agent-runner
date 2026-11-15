@@ -121,9 +121,10 @@ Các commit fix trong PR #2 đều đến từ việc chạy job thật, không 
 
 | Bước | Ai làm | Việc làm | Kết quả để theo dõi |
 |---|---|---|---|
-| 1 | Bạn | Bấm **🛠 Fix it** (chọn repo nếu có nhiều repo) | Notice: "Queued" |
-| 2 | Notifier | `approved` + tạo job `queued` (1 transaction) | DB `jobs` |
-| 3 | Worker | Claim job → `running`; lấy chi tiết issue từ Jira | Notice: "Agent running" |
+| 0 | Bạn | Comment phạm vi lên ticket (`@CLAUDE/CODEX` + `repo_dependencies`, `specs`, `hints`; format trong `scope.json`) | Comment Jira |
+| 1 | Bạn | Bấm **🛠 Fix it** | Notice: "Queued on a, b" — hoặc reply "cần phạm vi sửa từ maintainer" kèm mẫu để copy |
+| 2 | Notifier | Đọc comment phạm vi; hợp lệ → `approved` + 1 nhóm job `queued` (mỗi repo 1 job, 1 transaction) | DB `jobs` (`group_id`) |
+| 3 | Worker | Claim cả nhóm → `running`; lấy chi tiết issue + specs/hints từ Jira; 1 phiên agent trên mọi worktree của nhóm | Notice: "Agent running on a, b" |
 | 4 | Worker | `git fetch` + worktree `agent/<KEY>-j<id>` cạnh clone, copy `CLAUDE.md`/`AGENTS.md` | Thư mục `.agent-<repo>-<KEY>-j<id>` |
 | 5 | **AI** | Đọc code, tìm root cause, sửa tối thiểu, thêm test, chạy test | `data/jobs/<id>/agent.json` |
 | 5b | **AI** | (repo web có `e2e`) Build + chạy app local, login bằng profile trong `.secrets/`, chạy Playwright: kịch bản lỗi gốc, lỗi + phục hồi, 1 luồng hồi quy; chụp `NN-*.png`, ghi `e2e.json` | `data/jobs/<id>/evidence/` |
@@ -132,7 +133,7 @@ Các commit fix trong PR #2 đều đến từ việc chạy job thật, không 
 | 8 | Worker | Commit `fix(<KEY>): …` | Branch local |
 | 9 | Worker | (trừ khi `--no-push`) push + MR → `dev`. **Gate**: repo bật `auto_merge` + test ✅ + E2E ✅ → approve và **merge vào dev** ("chờ bàn giao"); không đạt → Draft MR kèm lý do | Link MR, notice "🔀 Merged vào dev — chờ bàn giao" |
 | 10 | Worker | Kill process group (dọn app server còn chạy), xóa worktree, cập nhật job + notice, gửi report. Khi có Draft MR: upload ảnh `<KEY>-j<id>-NN-*.png` lên Jira + comment có bảng kịch bản kèm thumbnail | `report.md`, Telegram reply, comment Jira |
-| 11 | Bạn | Ticket không qua gate: review Draft MR, hoặc **🔁 Retry** / **📦 Other repo** | — |
+| 11 | Bạn | Ticket không qua gate: review Draft MR, hoặc sửa comment phạm vi rồi **🔁 Retry** (bỏ qua repo đã merge) | — |
 
 ### 2.2b Bàn giao dev → test
 

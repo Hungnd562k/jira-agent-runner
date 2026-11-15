@@ -28,6 +28,7 @@ type Config struct {
 
 	DBPath    string
 	ReposFile string
+	ScopeFile string // format of the maintainer's scope comment (missing = built-in default)
 
 	// PipelineTimeout bounds watching a handover's CI/CD (worker; notifier uses it for "watch again").
 	PipelineTimeout time.Duration
@@ -43,6 +44,7 @@ func Load(requireTelegram bool) (*Config, error) {
 		TelegramBotToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
 		DBPath:           getenv("DB_PATH", "./data/tasks.db"),
 		ReposFile:        getenv("REPOS_FILE", "./repos.json"),
+		ScopeFile:        getenv("SCOPE_FILE", "./scope.json"),
 	}
 
 	var errs []error

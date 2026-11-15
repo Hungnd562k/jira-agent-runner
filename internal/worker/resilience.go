@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -56,37 +57,52 @@ func (w *Worker) retryDelay(n int) time.Duration {
 	return d
 }
 
-// maybeRetry queues the automatic retry of a transiently failed job. stopped = the worker is
-// shutting down: the job is requeued without backoff and without using up an attempt.
-// Returns the queued job, or ok=false when the failure is final.
-func (w *Worker) maybeRetry(ctx context.Context, log *slog.Logger, j store.Job, stopped bool) (store.Job, bool) {
-	if j.Status != store.JobFailed || (!stopped && (!isTransient(j.Error) || j.Attempt >= w.AutoRetries)) {
-		return store.Job{}, false
+// maybeRetry queues one automatic retry group for the jobs of a finished group that failed
+// transiently. stopped = the worker is shutting down: every failed job is requeued without
+// backoff and without using up an attempt. Returns the ids of the jobs that were retried.
+func (w *Worker) maybeRetry(ctx context.Context, log *slog.Logger, done []store.Job, stopped bool) map[int64]bool {
+	var retry []store.Job
+	attempt := 0
+	for _, j := range done {
+		if j.Status == store.JobFailed && (stopped || (isTransient(j.Error) && j.Attempt < w.AutoRetries)) {
+			retry = append(retry, j)
+			attempt = max(attempt, j.Attempt)
+		}
+	}
+	if len(retry) == 0 {
+		return nil
 	}
 	now := w.Now()
-	notBefore := now.Add(w.retryDelay(j.Attempt + 1))
+	notBefore := now.Add(w.retryDelay(attempt + 1))
 	if stopped {
 		notBefore = time.Time{}
 	}
-	next, err := w.Store.AutoRetry(ctx, j, !stopped, notBefore, now)
+	next, err := w.Store.AutoRetryGroup(ctx, retry, !stopped, notBefore, now)
 	if err != nil {
 		log.Warn("auto-retry", "err", err)
-		return store.Job{}, false
+		return nil
 	}
-	log.Info("auto-retry queued", "next_job", next.ID, "attempt", next.Attempt, "not_before", notBefore,
-		"resume_of", next.ResumeOf)
+	log.Info("auto-retry queued", "next_group", next[0].GroupID, "jobs", len(next), "attempt", next[0].Attempt,
+		"not_before", notBefore)
 	if !stopped {
-		w.reply(ctx, j.JiraKey, retryText(j, next, w.AutoRetries))
+		w.reply(ctx, retry[0].JiraKey, retryText(retry[0], next, w.AutoRetries))
 	}
-	w.updateNotice(ctx, next)
-	return next, true
+	w.updateNotice(ctx, retry[0].JiraKey)
+	ids := make(map[int64]bool, len(retry))
+	for _, j := range retry {
+		ids[j.ID] = true
+	}
+	return ids
 }
 
-func retryText(failed, next store.Job, max int) string {
+func retryText(failed store.Job, next []store.Job, max int) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "🔁 <b>Transient failure</b>: %s\nAuto-retry %d/%d at %s",
-		html.EscapeString(truncate(failed.Error, 300)), next.Attempt, max, next.NotBefore.Format("15:04"))
-	if next.ResumeOf > 0 {
+		html.EscapeString(truncate(failed.Error, 300)), next[0].Attempt, max, next[0].NotBefore.Format("15:04"))
+	if len(next) > 1 {
+		fmt.Fprintf(&b, " on %s", html.EscapeString(repoNames(next)))
+	}
+	if slices.ContainsFunc(next, func(j store.Job) bool { return j.ResumeOf > 0 }) {
 		b.WriteString(" — continuing the partial work")
 	}
 	return b.String()
@@ -128,15 +144,28 @@ func (w *Worker) recover(ctx context.Context) error {
 		}
 	}
 	w.sweepWorktrees(ctx)
+	// Interrupted jobs of one group are retried together, as one new group.
+	var order []int64
+	groups := map[int64][]store.Job{}
 	for _, j := range orphans {
 		if fresh, err := w.Store.GetJob(ctx, j.ID); err == nil {
 			j = fresh // sweep may have saved WIP
 		}
-		log := w.Log.With("job", j.ID, "key", j.JiraKey, "repo", j.RepoName)
-		log.Warn("orphaned job marked failed", "wip", j.WIPSHA != "")
-		w.updateNotice(ctx, j)
-		if _, ok := w.maybeRetry(ctx, log, j, false); !ok && j.WIPSHA != "" {
-			w.reply(ctx, j.JiraKey, wipText(j))
+		w.Log.Warn("orphaned job marked failed", "job", j.ID, "key", j.JiraKey, "repo", j.RepoName, "wip", j.WIPSHA != "")
+		if _, ok := groups[j.GroupID]; !ok {
+			order = append(order, j.GroupID)
+		}
+		groups[j.GroupID] = append(groups[j.GroupID], j)
+	}
+	for _, g := range order {
+		jobs := groups[g]
+		log := w.Log.With("group", g, "key", jobs[0].JiraKey)
+		w.updateNotice(ctx, jobs[0].JiraKey)
+		retried := w.maybeRetry(ctx, log, jobs, false)
+		for _, j := range jobs {
+			if !retried[j.ID] && j.WIPSHA != "" {
+				w.reply(ctx, j.JiraKey, wipText(j))
+			}
 		}
 	}
 	return nil

@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/Hungnd562k/jira-agent-runner/internal/jira"
 	"github.com/Hungnd562k/jira-agent-runner/internal/repos"
+	"github.com/Hungnd562k/jira-agent-runner/internal/scope"
 	"github.com/Hungnd562k/jira-agent-runner/internal/store"
 	"github.com/Hungnd562k/jira-agent-runner/internal/telegram"
 )
@@ -22,6 +25,11 @@ type Messenger interface {
 	GetUpdates(ctx context.Context, offset int64, timeout time.Duration) ([]telegram.Update, error)
 }
 
+// IssueGetter loads an issue with its comments (to read the maintainer's scope comment).
+type IssueGetter interface {
+	GetIssue(ctx context.Context, key string) (jira.IssueDetail, error)
+}
+
 // Service runs sync → notify cycles and handles Telegram button presses.
 type Service struct {
 	Syncer        *Syncer
@@ -30,6 +38,8 @@ type Service struct {
 	ChatID        int64
 	SnoozeChoices []time.Duration
 	Repos         repos.Config // candidate repos per Jira project for "Fix it"
+	Issues        IssueGetter  // reads the scope comment on "Fix it" / "Retry"
+	Scope         scope.Format // format of the maintainer's scope comment (scope.json)
 	PollInterval  time.Duration
 	RemindAfter   time.Duration // re-remind notified tasks untouched this long; also "later" for handovers
 	// HandoverTimeout bounds CI/CD watching after "watch again" (default 90m).
@@ -258,6 +268,17 @@ func (s *Service) handleCallback(ctx context.Context, q *telegram.CallbackQuery)
 		return
 	}
 
+	// Fix it / Retry need the maintainer's scope comment: read it before taking the lock
+	// (a Jira round-trip must not block other buttons).
+	var sc scopeCheck
+	if cb.Action == telegram.ActFix || cb.Action == telegram.ActRetry {
+		if sc = s.checkScope(ctx, cb.Key); sc.err != nil {
+			s.Log.Warn("read scope comment", "key", cb.Key, "err", sc.err)
+			answer("Không đọc được ticket từ Jira, thử lại")
+			return
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -268,70 +289,45 @@ func (s *Service) handleCallback(ctx context.Context, q *telegram.CallbackQuery)
 	)
 	switch {
 	case cb.Action == telegram.ActFix:
-		candidates := s.Repos.For(cb.Key)
-		switch len(candidates) {
-		case 0:
+		if t, err = s.Store.Get(ctx, cb.Key); err != nil {
+			break
+		}
+		if !approvable(t.State) {
+			err = store.ErrInvalidTransition
+			break
+		}
+		switch {
+		case !sc.configured:
 			t, err = s.Store.Approve(ctx, cb.Key, now)
 			toast = "✅ Approved (no repo configured)"
-		case 1:
-			t, _, err = s.Store.ApproveAndEnqueue(ctx, cb.Key, candidates[0].Name, now)
-			toast = "🕓 Queued on " + candidates[0].Name
+		case sc.scope == nil:
+			s.askScope(ctx, t, msgID, sc)
+			answer("📝 Cần phạm vi sửa từ maintainer — xem hướng dẫn")
+			return
 		default:
-			// Ask which repo first; nothing changes until a repo is picked.
-			if t, err = s.Store.Get(ctx, cb.Key); err == nil {
-				if !approvable(t.State) {
-					err = store.ErrInvalidTransition
-					break
-				}
-				names := make([]string, len(candidates))
-				for i, r := range candidates {
-					names[i] = r.Name
-				}
-				text, _ := s.view(t)
-				if err := s.TG.EditMessage(ctx, s.ChatID, msgID, text, telegram.RepoKeyboard(t.JiraKey, names)); err != nil && !telegram.IsNotModified(err) {
-					s.Log.Warn("edit message", "key", t.JiraKey, "err", err)
-				}
-				answer("Choose a repo")
-				return
-			}
+			t, _, err = s.Store.ApproveAndEnqueueRepos(ctx, cb.Key, sc.scope.Repos, now)
+			toast = "🕓 Queued on " + strings.Join(sc.scope.Repos, ", ")
 		}
-	case cb.Action == telegram.ActRepo:
-		candidates := s.Repos.For(cb.Key)
-		if cb.RepoIndex >= len(candidates) {
-			answer("Unknown repo — repos.json changed?")
-			return
-		}
-		repo := candidates[cb.RepoIndex].Name
-		if cur, gerr := s.Store.Get(ctx, cb.Key); gerr == nil && cur.State == store.StateApproved {
-			t, err = s.requeue(ctx, cb.Key, repo, now) // "Other repo" on an approved task
-		} else {
-			t, _, err = s.Store.ApproveAndEnqueue(ctx, cb.Key, repo, now)
-		}
-		toast = "🕓 Queued on " + repo
 	case cb.Action == telegram.ActRetry:
-		var last store.Job
-		if last, err = s.Store.LatestJob(ctx, cb.Key); err == nil {
-			t, err = s.requeue(ctx, cb.Key, last.RepoName, now)
-			toast = "🔁 Retrying on " + last.RepoName
+		if t, err = s.Store.Get(ctx, cb.Key); err != nil {
+			break
 		}
-	case cb.Action == telegram.ActOtherRepo:
-		candidates := s.Repos.For(cb.Key)
-		if t, err = s.Store.Get(ctx, cb.Key); err == nil {
-			if t.State != store.StateApproved || len(candidates) == 0 {
-				err = store.ErrInvalidTransition
-				break
-			}
-			names := make([]string, len(candidates))
-			for i, r := range candidates {
-				names[i] = r.Name
-			}
-			text, _ := s.render(ctx, t)
-			if err := s.TG.EditMessage(ctx, s.ChatID, msgID, text, telegram.RepoKeyboard(t.JiraKey, names)); err != nil && !telegram.IsNotModified(err) {
-				s.Log.Warn("edit message", "key", t.JiraKey, "err", err)
-			}
-			answer("Choose a repo")
+		if t.State != store.StateApproved || !sc.configured {
+			err = store.ErrInvalidTransition
+			break
+		}
+		if sc.scope == nil {
+			s.askScope(ctx, t, msgID, sc)
+			answer("📝 Cần phạm vi sửa từ maintainer — xem hướng dẫn")
 			return
 		}
+		todo := s.retryRepos(ctx, cb.Key, sc.scope.Repos)
+		if len(todo) == 0 {
+			answer("Mọi repo trong phạm vi đã merge — không còn gì để chạy lại")
+			return
+		}
+		t, err = s.requeue(ctx, cb.Key, todo, now)
+		toast = "🔁 Retrying on " + strings.Join(todo, ", ")
 	case cb.Action == telegram.ActSnooze && cb.Snooze > 0:
 		t, err = s.Store.Snooze(ctx, cb.Key, now.Add(cb.Snooze), now)
 		toast = "⏰ Snoozed " + telegram.FormatDuration(cb.Snooze)
@@ -397,9 +393,9 @@ func approvable(st store.State) bool {
 	return st == store.StateNew || st == store.StateNotified || st == store.StateSnoozed
 }
 
-// requeue queues a new job for an already approved task and returns the task for re-rendering.
-func (s *Service) requeue(ctx context.Context, key, repo string, now time.Time) (store.Task, error) {
-	if _, err := s.Store.Enqueue(ctx, key, repo, now); err != nil {
+// requeue queues a new job group for an already approved task and returns the task for re-rendering.
+func (s *Service) requeue(ctx context.Context, key string, repoNames []string, now time.Time) (store.Task, error) {
+	if _, err := s.Store.EnqueueRepos(ctx, key, repoNames, now); err != nil {
 		return store.Task{}, err
 	}
 	return s.Store.Get(ctx, key)

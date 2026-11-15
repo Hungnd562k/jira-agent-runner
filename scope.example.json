@@ -1,0 +1,23 @@
+{
+  "marker": "@CLAUDE/CODEX",
+  "authors": [],
+  "fields": [
+    {
+      "key": "repo_dependencies",
+      "role": "repos",
+      "required": true,
+      "placeholder": "<tên repo trong repos.json, cách nhau bởi dấu phẩy>",
+      "description": "các repo/service agent được phép sửa (tên trong repos.json), cách nhau bởi dấu phẩy"
+    },
+    {
+      "key": "specs",
+      "placeholder": "<Dành cho feats, yêu cầu sửa đổi>",
+      "description": "đặc tả / yêu cầu sửa đổi (dành cho feature); bỏ trống với bug thuần"
+    },
+    {
+      "key": "hints",
+      "placeholder": "<gợi ý giúp agent khoanh vùng nhanh hơn: file, màn hình, API, nguyên nhân nghi ngờ>",
+      "description": "gợi ý từ maintainer giúp agent xác định phạm vi chỉnh sửa nhanh hơn"
+    }
+  ]
+}

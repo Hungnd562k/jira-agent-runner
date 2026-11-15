@@ -42,3 +42,6 @@ go.work.sum
 
 # Local repo mapping (host paths); see repos.example.json
 /repos.json
+
+# Local scope-comment format; see scope.example.json
+/scope.json

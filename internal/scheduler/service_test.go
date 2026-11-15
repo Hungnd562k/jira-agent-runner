@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/Hungnd562k/jira-agent-runner/internal/jira"
 	"github.com/Hungnd562k/jira-agent-runner/internal/repos"
+	"github.com/Hungnd562k/jira-agent-runner/internal/scope"
 	"github.com/Hungnd562k/jira-agent-runner/internal/store"
 	"github.com/Hungnd562k/jira-agent-runner/internal/telegram"
 )
@@ -68,6 +70,8 @@ func newService(t *testing.T, issues ...jira.Issue) (*Service, *fakeSource, *fak
 		TG:            tg,
 		ChatID:        chatID,
 		SnoozeChoices: []time.Duration{30 * time.Minute, 2 * time.Hour},
+		Issues:        &fakeIssues{},
+		Scope:         scope.Default(),
 		Now:           now,
 		Log:           slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}, src, tg
@@ -236,107 +240,155 @@ func TestApprovedNeverReminded(t *testing.T) {
 	}
 }
 
-func TestFixItSingleRepoQueues(t *testing.T) {
-	ctx := context.Background()
-	s, _, tg := newService(t, jira.Issue{Key: "A-1", Summary: "bug", URL: "u"})
-	s.Repos = repos.Config{"A": {{Name: "api"}}}
-	s.Cycle(ctx)
-
-	press(s, chatID, 1, "fix:A-1")
-	job, err := s.Store.LatestJob(ctx, "A-1")
-	if err != nil || job.Status != store.JobQueued || job.RepoName != "api" {
-		t.Fatalf("job = %+v %v", job, err)
-	}
-	last := tg.edits[len(tg.edits)-1]
-	if !strings.Contains(last.text, "Queued") || len(last.kb) != 0 {
-		t.Fatalf("edit = %+v", last)
-	}
-	if got := tg.answers[len(tg.answers)-1]; got != "🕓 Queued on api" {
-		t.Errorf("toast = %q", got)
-	}
+// fakeIssues serves issue comments for the scope comment lookup.
+type fakeIssues struct {
+	comments map[string][]jira.Comment
+	err      error
+	calls    int
 }
 
-func TestFixItMultiRepoAsksThenQueues(t *testing.T) {
+func (f *fakeIssues) GetIssue(_ context.Context, key string) (jira.IssueDetail, error) {
+	f.calls++
+	if f.err != nil {
+		return jira.IssueDetail{}, f.err
+	}
+	return jira.IssueDetail{Issue: jira.Issue{Key: key, URL: "https://jira/browse/" + key}, Comments: f.comments[key]}, nil
+}
+
+func (f *fakeIssues) setScope(key, body string) {
+	if f.comments == nil {
+		f.comments = map[string][]jira.Comment{}
+	}
+	f.comments[key] = append(f.comments[key], jira.Comment{Author: "Hung", Body: body})
+}
+
+func issuesOf(s *Service) *fakeIssues { return s.Issues.(*fakeIssues) }
+
+func TestFixItWithoutScopeSendsGuide(t *testing.T) {
 	ctx := context.Background()
 	s, _, tg := newService(t, jira.Issue{Key: "A-1", Summary: "bug", URL: "u"})
 	s.Repos = repos.Config{"A": {{Name: "api"}, {Name: "web"}}}
 	s.Cycle(ctx)
+	issuesOf(s).setScope("A-1", "please fix asap")
 
 	press(s, chatID, 1, "fix:A-1")
 	if task, _ := s.Store.Get(ctx, "A-1"); task.State != store.StateNotified {
-		t.Fatalf("state changed before repo chosen: %s", task.State)
+		t.Fatalf("approved without a scope comment: %s", task.State)
 	}
-	kb := tg.edits[len(tg.edits)-1].kb
-	if len(kb) != 3 || kb[1][0].CallbackData != "repo:A-1:1" {
-		t.Fatalf("repo keyboard = %+v", kb)
+	if _, err := s.Store.LatestJob(ctx, "A-1"); !store.IsNotFound(err) {
+		t.Fatalf("job queued without scope: %v", err)
 	}
-
-	press(s, chatID, 1, "back:A-1") // back restores main keyboard
-	if kb := tg.edits[len(tg.edits)-1].kb; len(kb) != 1 || len(kb[0]) != 2 {
-		t.Fatalf("back keyboard = %+v", kb)
+	guide := tg.sent[len(tg.sent)-1]
+	for _, want := range []string{"cần phạm vi sửa từ maintainer", "chưa có comment", "<pre>@CLAUDE/CODEX,\nrepo_dependencies: api, web\nspecs: &lt;",
+		"hints: ", "repo_dependencies (bắt buộc)", "https://jira/browse/A-1"} {
+		if !strings.Contains(guide.text, want) {
+			t.Errorf("guide misses %q:\n%s", want, guide.text)
+		}
 	}
-
-	press(s, chatID, 1, "repo:A-1:1")
-	job, err := s.Store.LatestJob(ctx, "A-1")
-	if err != nil || job.RepoName != "web" {
-		t.Fatalf("job = %+v %v", job, err)
+	if guide.replyTo != 1 {
+		t.Errorf("guide should reply to the notice, replyTo=%d", guide.replyTo)
 	}
-	if !strings.Contains(tg.edits[len(tg.edits)-1].text, "web") {
-		t.Errorf("footer should name repo: %q", tg.edits[len(tg.edits)-1].text)
+	if got := tg.answers[len(tg.answers)-1]; !strings.Contains(got, "Cần phạm vi") {
+		t.Errorf("toast = %q", got)
 	}
 
-	press(s, chatID, 1, "repo:A-1:0") // stale button after approval
-	if n, _ := s.Store.LatestJob(ctx, "A-1"); n.ID != job.ID {
-		t.Fatal("second job enqueued from stale button")
+	// An invalid scope comment explains why.
+	issuesOf(s).setScope("A-1", "@CLAUDE/CODEX,\nrepo_dependencies: api, billing")
+	press(s, chatID, 1, "fix:A-1")
+	if g := tg.sent[len(tg.sent)-1].text; !strings.Contains(g, "chưa hợp lệ") || !strings.Contains(g, "billing") {
+		t.Errorf("invalid-scope guide = %s", g)
 	}
-	press(s, chatID, 1, "repo:A-1:9")
-	if got := tg.answers[len(tg.answers)-1]; !strings.Contains(got, "Unknown repo") {
-		t.Errorf("out of range toast = %q", got)
+
+	// Jira down: nothing changes, the user is told to retry.
+	issuesOf(s).err = errors.New("jira down")
+	press(s, chatID, 1, "fix:A-1")
+	if got := tg.answers[len(tg.answers)-1]; !strings.Contains(got, "Không đọc được ticket") {
+		t.Errorf("jira error toast = %q", got)
 	}
 }
 
-func TestRetryAndOtherRepo(t *testing.T) {
+func TestFixItQueuesScopedRepos(t *testing.T) {
 	ctx := context.Background()
 	s, _, tg := newService(t, jira.Issue{Key: "A-1", Summary: "bug", URL: "u"})
-	s.Repos = repos.Config{"A": {{Name: "api"}, {Name: "web"}}}
+	s.Repos = repos.Config{"A": {{Name: "api"}, {Name: "web"}, {Name: "batch"}}}
 	s.Cycle(ctx)
-	press(s, chatID, 1, "repo:A-1:0")
+	issuesOf(s).setScope("A-1", "---\n@CLAUDE/CODEX,\nrepo_dependencies: web, api\nspecs: thêm cột\nhints: xem Foo\n---")
+
+	press(s, chatID, 1, "fix:A-1")
+	jobs, err := s.Store.LatestGroup(ctx, "A-1")
+	if err != nil || len(jobs) != 2 || jobs[0].RepoName != "web" || jobs[1].RepoName != "api" || jobs[0].Status != store.JobQueued {
+		t.Fatalf("jobs = %+v %v", jobs, err)
+	}
+	last := tg.edits[len(tg.edits)-1]
+	if !strings.Contains(last.text, "Queued") || !strings.Contains(last.text, "web, api") || len(last.kb) != 0 {
+		t.Fatalf("edit = %+v", last)
+	}
+	if got := tg.answers[len(tg.answers)-1]; got != "🕓 Queued on web, api" {
+		t.Errorf("toast = %q", got)
+	}
+	press(s, chatID, 1, "fix:A-1") // stale button after approval
+	if g, _ := s.Store.LatestGroup(ctx, "A-1"); g[0].ID != jobs[0].ID {
+		t.Fatal("second group enqueued from stale button")
+	}
+}
+
+func TestFixItWithoutConfiguredReposApprovesWithoutJira(t *testing.T) {
+	ctx := context.Background()
+	s, _, _ := newService(t, jira.Issue{Key: "A-1", Summary: "bug", URL: "u"})
+	s.Cycle(ctx)
+	press(s, chatID, 1, "fix:A-1")
+	if task, _ := s.Store.Get(ctx, "A-1"); task.State != store.StateApproved || issuesOf(s).calls != 0 {
+		t.Fatalf("state = %s, jira calls = %d", task.State, issuesOf(s).calls)
+	}
+}
+
+func TestRetryRereadsScopeAndSkipsMerged(t *testing.T) {
+	ctx := context.Background()
+	s, _, tg := newService(t, jira.Issue{Key: "A-1", Summary: "bug", URL: "u"})
+	s.Repos = repos.Config{"A": {{Name: "api"}, {Name: "web"}, {Name: "batch"}}}
+	s.Cycle(ctx)
+	issuesOf(s).setScope("A-1", "@CLAUDE/CODEX\nrepo_dependencies: api, web")
+	press(s, chatID, 1, "fix:A-1")
 
 	press(s, chatID, 1, "rty:A-1") // still queued → refused
 	if got := tg.answers[len(tg.answers)-1]; got != "A job is already queued or running" {
 		t.Fatalf("retry while queued toast = %q", got)
 	}
 
-	first, _ := s.Store.LatestJob(ctx, "A-1")
-	s.Store.ClaimJob(ctx, s.Now())
-	s.Store.FinishJob(ctx, first.ID, store.JobResult{Status: store.JobFailed, Error: "boom"}, s.Now())
+	group, _, _ := s.Store.ClaimGroup(ctx, s.Now())
+	s.Store.FinishJob(ctx, group[0].ID, store.JobResult{Status: store.JobSucceeded, MRURL: "mr", MergedSHA: "abc"}, s.Now())
+	s.Store.FinishJob(ctx, group[1].ID, store.JobResult{Status: store.JobFailed, Error: "boom"}, s.Now())
 
-	// A finished job's notice offers Retry / Other repo.
 	task, _ := s.Store.Get(ctx, "A-1")
-	_, kb := s.render(ctx, task)
-	if len(kb) != 1 || kb[0][0].CallbackData != "rty:A-1" || kb[0][1].CallbackData != "orp:A-1" {
-		t.Fatalf("finished-job keyboard = %+v", kb)
+	text, kb := s.render(ctx, task)
+	if len(kb) != 1 || len(kb[0]) != 1 || kb[0][0].CallbackData != "rty:A-1" {
+		t.Fatalf("finished-group keyboard = %+v", kb)
+	}
+	if !strings.Contains(text, "Merged vào dev") || !strings.Contains(text, "Agent failed</b> on <code>web") {
+		t.Errorf("group footer = %s", text)
 	}
 
+	// The maintainer widened the scope: retry re-reads it and skips the merged repo.
+	issuesOf(s).setScope("A-1", "@CLAUDE/CODEX\nrepo_dependencies: api, web, batch\nhints: batch job too")
 	press(s, chatID, 1, "rty:A-1")
-	retry, _ := s.Store.LatestJob(ctx, "A-1")
-	if retry.ID == first.ID || retry.RepoName != "api" || retry.Status != store.JobQueued {
-		t.Fatalf("retry job = %+v", retry)
+	retry, _ := s.Store.LatestGroup(ctx, "A-1")
+	if len(retry) != 2 || retry[0].RepoName != "web" || retry[1].RepoName != "batch" || retry[0].GroupID == group[0].GroupID {
+		t.Fatalf("retry group = %+v", retry)
 	}
-	if got := tg.answers[len(tg.answers)-1]; got != "🔁 Retrying on api" {
+	if got := tg.answers[len(tg.answers)-1]; got != "🔁 Retrying on web, batch" {
 		t.Errorf("retry toast = %q", got)
 	}
 
-	s.Store.ClaimJob(ctx, s.Now())
-	s.Store.FinishJob(ctx, retry.ID, store.JobResult{Status: store.JobSucceeded}, s.Now())
-	press(s, chatID, 1, "orp:A-1")
-	if kb := tg.edits[len(tg.edits)-1].kb; len(kb) != 3 || kb[1][0].CallbackData != "repo:A-1:1" {
-		t.Fatalf("other-repo keyboard = %+v", kb)
+	// Scope comment removed (invalid now): retry sends the guide instead.
+	group, _, _ = s.Store.ClaimGroup(ctx, s.Now())
+	for _, j := range group {
+		s.Store.FinishJob(ctx, j.ID, store.JobResult{Status: store.JobFailed, Error: "x"}, s.Now())
 	}
-	press(s, chatID, 1, "repo:A-1:1")
-	other, _ := s.Store.LatestJob(ctx, "A-1")
-	if other.RepoName != "web" || other.Status != store.JobQueued {
-		t.Fatalf("other repo job = %+v", other)
+	issuesOf(s).setScope("A-1", "@CLAUDE/CODEX\nspecs: only specs")
+	sends := len(tg.sent)
+	press(s, chatID, 1, "rty:A-1")
+	if len(tg.sent) != sends+1 || !strings.Contains(tg.sent[len(tg.sent)-1].text, "thiếu repo_dependencies") {
+		t.Fatalf("expected the scope guide, sent = %+v", tg.sent[sends:])
 	}
 }
 
@@ -345,6 +397,7 @@ func TestRefreshApprovedAddsJobButtons(t *testing.T) {
 	s, _, tg := newService(t, jira.Issue{Key: "A-1", Summary: "bug", URL: "u"})
 	s.Repos = repos.Config{"A": {{Name: "api"}}}
 	s.Cycle(ctx)
+	issuesOf(s).setScope("A-1", "@CLAUDE/CODEX\nrepo_dependencies: api")
 	press(s, chatID, 1, "fix:A-1")
 	j, _ := s.Store.LatestJob(ctx, "A-1")
 	s.Store.ClaimJob(ctx, s.Now())

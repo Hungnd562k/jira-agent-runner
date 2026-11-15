@@ -30,6 +30,9 @@ func (w *Worker) Publish(ctx context.Context, jobID int64) error {
 	if job.Status == store.JobQueued || job.Status == store.JobRunning {
 		return fmt.Errorf("job %d is %s", jobID, job.Status)
 	}
+	if job.Status == store.JobSucceeded && job.Error != "" {
+		return fmt.Errorf("job %d has nothing to publish: %s", jobID, job.Error)
+	}
 	if job.MRURL != "" {
 		return fmt.Errorf("job %d already has an MR: %s", jobID, job.MRURL)
 	}
@@ -88,7 +91,7 @@ func (w *Worker) Publish(ctx context.Context, jobID int64) error {
 		return err
 	}
 	log.Info("job published", "mr", res.MRURL, "merged", res.MergedSHA != "")
-	w.updateNotice(ctx, done)
+	w.updateNotice(ctx, done.JiraKey)
 	w.publish(ctx, log, done, rep)
 	return nil
 }

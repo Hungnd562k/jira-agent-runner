@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -41,12 +43,13 @@ type Job struct {
 	NotBefore   time.Time // queued: not claimed before this (auto-retry backoff)
 	AgentPGID   int       // running: process group of the agent (reaped after a worker crash)
 	BootID      string    // host boot AgentPGID belongs to (a PGID from another boot is meaningless)
+	GroupID     int64     // jobs queued together (one per repo of the scope) share it; = ID of the first
 }
 
 // jobColumns is shared by every SELECT/RETURNING so scanJob always matches.
 const jobColumns = `id, jira_key, repo_name, status, branch, mr_url, error, tests_passed,
 	created_at, started_at, finished_at, mr_iid, merged_sha, merged_at, handover_id, delivered_at,
-	wip_sha, resume_of, attempt, not_before, agent_pgid, boot_id`
+	wip_sha, resume_of, attempt, not_before, agent_pgid, boot_id, COALESCE(group_id, id)`
 
 const selectJob = `SELECT ` + jobColumns + ` FROM jobs`
 
@@ -62,7 +65,7 @@ func scanJob(r scanner) (Job, error) {
 	)
 	if err := r.Scan(&j.ID, &j.JiraKey, &j.RepoName, &j.Status, &j.Branch, &j.MRURL, &j.Error, &passed,
 		&created, &started, &finished, &j.MRIID, &j.MergedSHA, &merged, &handover, &delivered,
-		&j.WIPSHA, &resumeOf, &j.Attempt, &notBef, &j.AgentPGID, &j.BootID); err != nil {
+		&j.WIPSHA, &resumeOf, &j.Attempt, &notBef, &j.AgentPGID, &j.BootID, &j.GroupID); err != nil {
 		return Job{}, err
 	}
 	j.MergedAt = fromNull(merged)
@@ -82,31 +85,95 @@ func scanJob(r scanner) (Job, error) {
 
 // ApproveAndEnqueue approves the task and queues an agent job on repo, atomically.
 func (s *Store) ApproveAndEnqueue(ctx context.Context, key, repo string, now time.Time) (Task, Job, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	t, jobs, err := s.ApproveAndEnqueueRepos(ctx, key, []string{repo}, now)
 	if err != nil {
 		return Task{}, Job{}, err
+	}
+	return t, jobs[0], nil
+}
+
+// ApproveAndEnqueueRepos approves the task and queues one job group covering repos (one job
+// per repo, run by a single agent session), atomically.
+func (s *Store) ApproveAndEnqueueRepos(ctx context.Context, key string, repoNames []string, now time.Time) (Task, []Job, error) {
+	if len(repoNames) == 0 {
+		return Task{}, nil, errors.New("no repo to queue")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Task{}, nil, err
 	}
 	defer tx.Rollback()
 
 	t, err := transitionTx(ctx, tx, key, []State{StateNew, StateNotified, StateSnoozed}, StateApproved,
-		"remind_at = NULL", nil, "approved", repo, now)
+		"remind_at = NULL", nil, "approved", strings.Join(repoNames, ","), now)
 	if err != nil {
-		return Task{}, Job{}, err
+		return Task{}, nil, err
 	}
-	res, err := tx.ExecContext(ctx, `INSERT INTO jobs (jira_key, repo_name, status, created_at) VALUES (?, ?, ?, ?)`,
-		key, repo, JobQueued, now.Unix())
+	jobs, err := insertGroup(ctx, tx, key, repoNames, 0, time.Time{}, now)
 	if err != nil {
-		return Task{}, Job{}, err
+		return Task{}, nil, err
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return Task{}, Job{}, err
+	return t, jobs, tx.Commit()
+}
+
+// insertGroup queues one job per repo sharing a group id. A repo whose latest job failed with
+// partial work (WIP) continues from it. The caller checks the task state.
+func insertGroup(ctx context.Context, tx *sql.Tx, key string, repoNames []string, attempt int, notBefore, now time.Time) ([]Job, error) {
+	var active int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE jira_key = ? AND status IN (?, ?)`,
+		key, JobQueued, JobRunning).Scan(&active); err != nil {
+		return nil, err
 	}
-	j, err := scanJob(tx.QueryRowContext(ctx, selectJob+` WHERE id = ?`, id))
-	if err != nil {
-		return Task{}, Job{}, err
+	if active > 0 {
+		return nil, ErrJobActive
 	}
-	return t, j, tx.Commit()
+	var nb sql.NullInt64
+	if !notBefore.IsZero() {
+		nb = sql.NullInt64{Int64: notBefore.Unix(), Valid: true}
+	}
+	var (
+		group int64
+		ids   []int64
+	)
+	for _, repo := range repoNames {
+		var resumeOf sql.NullInt64
+		last, err := scanJob(tx.QueryRowContext(ctx, selectJob+` WHERE jira_key = ? AND repo_name = ? ORDER BY id DESC LIMIT 1`, key, repo))
+		switch {
+		case err == nil && last.Status == JobFailed && last.WIPSHA != "":
+			resumeOf = sql.NullInt64{Int64: last.ID, Valid: true}
+		case err != nil && !errors.Is(err, sql.ErrNoRows):
+			return nil, err
+		}
+		var g sql.NullInt64
+		if group != 0 {
+			g = sql.NullInt64{Int64: group, Valid: true}
+		}
+		res, err := tx.ExecContext(ctx, `INSERT INTO jobs (jira_key, repo_name, status, created_at, resume_of, attempt, not_before, group_id)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, key, repo, JobQueued, now.Unix(), resumeOf, attempt, nb, g)
+		if err != nil {
+			return nil, err
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			return nil, err
+		}
+		if group == 0 {
+			group = id
+			if _, err := tx.ExecContext(ctx, `UPDATE jobs SET group_id = ? WHERE id = ?`, id, id); err != nil {
+				return nil, err
+			}
+		}
+		ids = append(ids, id)
+	}
+	out := make([]Job, 0, len(ids))
+	for _, id := range ids {
+		j, err := scanJob(tx.QueryRowContext(ctx, selectJob+` WHERE id = ?`, id))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, nil
 }
 
 // LatestJob returns the most recent job for a task, or sql.ErrNoRows.
@@ -119,28 +186,26 @@ func (s *Store) GetJob(ctx context.Context, id int64) (Job, error) {
 	return scanJob(s.db.QueryRowContext(ctx, selectJob+` WHERE id = ?`, id))
 }
 
-// ClaimJob atomically moves the oldest due queued job to running (jobs waiting for a retry
-// backoff are skipped until not_before). ok=false when nothing is due.
-func (s *Store) ClaimJob(ctx context.Context, now time.Time) (Job, bool, error) {
-	j, err := scanJob(s.db.QueryRowContext(ctx, `UPDATE jobs SET status = ?, started_at = ?
-		WHERE id = (SELECT id FROM jobs WHERE status = ? AND (not_before IS NULL OR not_before <= ?) ORDER BY id LIMIT 1)
-		RETURNING `+jobColumns, JobRunning, now.Unix(), JobQueued, now.Unix()))
-	if errors.Is(err, sql.ErrNoRows) {
-		return Job{}, false, nil
-	}
-	if err != nil {
-		return Job{}, false, err
-	}
-	return j, true, nil
-}
-
-// FailOrphaned marks jobs left running (e.g. worker crashed) as failed. Call at worker start.
-func (s *Store) FailOrphaned(ctx context.Context, now time.Time) ([]Job, error) {
-	rows, err := s.db.QueryContext(ctx, `UPDATE jobs SET status = ?, error = 'interrupted (worker restarted)', finished_at = ?
-		WHERE status = ? RETURNING `+jobColumns, JobFailed, now.Unix(), JobRunning)
+// LatestGroup returns the jobs of the task's most recent group (ordered by id), or
+// sql.ErrNoRows when the task has no job.
+func (s *Store) LatestGroup(ctx context.Context, key string) ([]Job, error) {
+	last, err := s.LatestJob(ctx, key)
 	if err != nil {
 		return nil, err
 	}
+	return s.Group(ctx, last.GroupID)
+}
+
+// Group returns the jobs of a group, ordered by id.
+func (s *Store) Group(ctx context.Context, groupID int64) ([]Job, error) {
+	rows, err := s.db.QueryContext(ctx, selectJob+` WHERE COALESCE(group_id, id) = ? ORDER BY id`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	return collectJobs(rows)
+}
+
+func collectJobs(rows *sql.Rows) ([]Job, error) {
 	defer rows.Close()
 	var out []Job
 	for rows.Next() {
@@ -150,7 +215,59 @@ func (s *Store) FailOrphaned(ctx context.Context, now time.Time) ([]Job, error) 
 		}
 		out = append(out, j)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].ID < out[b].ID })
+	return out, nil
+}
+
+// ClaimJob claims the next due group (see ClaimGroup) and returns its first job.
+func (s *Store) ClaimJob(ctx context.Context, now time.Time) (Job, bool, error) {
+	jobs, ok, err := s.ClaimGroup(ctx, now)
+	if err != nil || !ok {
+		return Job{}, ok, err
+	}
+	return jobs[0], true, nil
+}
+
+// ClaimGroup atomically moves the oldest due queued job and the rest of its group to running
+// (jobs waiting for a retry backoff are skipped until not_before). ok=false when nothing is due.
+func (s *Store) ClaimGroup(ctx context.Context, now time.Time) ([]Job, bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback()
+	var group int64
+	err = tx.QueryRowContext(ctx, `SELECT COALESCE(group_id, id) FROM jobs
+		WHERE status = ? AND (not_before IS NULL OR not_before <= ?) ORDER BY id LIMIT 1`, JobQueued, now.Unix()).Scan(&group)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	rows, err := tx.QueryContext(ctx, `UPDATE jobs SET status = ?, started_at = ?
+		WHERE status = ? AND COALESCE(group_id, id) = ? RETURNING `+jobColumns, JobRunning, now.Unix(), JobQueued, group)
+	if err != nil {
+		return nil, false, err
+	}
+	jobs, err := collectJobs(rows)
+	if err != nil {
+		return nil, false, err
+	}
+	return jobs, len(jobs) > 0, tx.Commit()
+}
+
+// FailOrphaned marks jobs left running (e.g. worker crashed) as failed. Call at worker start.
+func (s *Store) FailOrphaned(ctx context.Context, now time.Time) ([]Job, error) {
+	rows, err := s.db.QueryContext(ctx, `UPDATE jobs SET status = ?, error = 'interrupted (worker restarted)', finished_at = ?
+		WHERE status = ? RETURNING `+jobColumns, JobFailed, now.Unix(), JobRunning)
+	if err != nil {
+		return nil, err
+	}
+	return collectJobs(rows)
 }
 
 // SetJobAgent records the running agent's process group so a restarted worker can reap it.
@@ -223,72 +340,72 @@ func (s *Store) FinishJob(ctx context.Context, id int64, r JobResult, now time.T
 // ErrJobActive means the task already has a queued or running job.
 var ErrJobActive = errors.New("a job is already queued or running for this task")
 
-// Enqueue queues another job (manual retry / other repo) for an already approved task.
-// A retry on the same repo continues the partial work (WIP) of the latest failed job.
+// Enqueue queues another job (manual retry) for an already approved task.
+// A retry on the same repo continues the partial work (WIP) of its latest failed job.
 func (s *Store) Enqueue(ctx context.Context, key, repo string, now time.Time) (Job, error) {
-	return s.enqueue(ctx, key, repo, 0, time.Time{}, "requeued", now)
+	jobs, err := s.EnqueueRepos(ctx, key, []string{repo}, now)
+	if err != nil {
+		return Job{}, err
+	}
+	return jobs[0], nil
 }
 
-// AutoRetry queues the automatic retry of a job that failed transiently: same repo, next
-// attempt, not claimed before notBefore, continuing the failed job's WIP when it has one.
-// countAttempt=false (worker shutdown) keeps the attempt number.
+// EnqueueRepos queues a new job group over repos for an already approved task.
+func (s *Store) EnqueueRepos(ctx context.Context, key string, repoNames []string, now time.Time) ([]Job, error) {
+	return s.enqueue(ctx, key, repoNames, 0, time.Time{}, "requeued", now)
+}
+
+// AutoRetry queues the automatic retry of a job that failed transiently (see AutoRetryGroup).
 func (s *Store) AutoRetry(ctx context.Context, failed Job, countAttempt bool, notBefore, now time.Time) (Job, error) {
-	attempt := failed.Attempt
+	jobs, err := s.AutoRetryGroup(ctx, []Job{failed}, countAttempt, notBefore, now)
+	if err != nil {
+		return Job{}, err
+	}
+	return jobs[0], nil
+}
+
+// AutoRetryGroup queues the automatic retry of jobs that failed transiently, as one new group:
+// same repos, next attempt, not claimed before notBefore, each continuing its job's WIP when it
+// has one. countAttempt=false (worker shutdown) keeps the attempt number.
+func (s *Store) AutoRetryGroup(ctx context.Context, failed []Job, countAttempt bool, notBefore, now time.Time) ([]Job, error) {
+	if len(failed) == 0 {
+		return nil, errors.New("no job to retry")
+	}
+	attempt := 0
+	names := make([]string, 0, len(failed))
+	for _, j := range failed {
+		attempt = max(attempt, j.Attempt)
+		names = append(names, j.RepoName)
+	}
 	if countAttempt {
 		attempt++
 	}
-	return s.enqueue(ctx, failed.JiraKey, failed.RepoName, attempt, notBefore, "auto_retry", now)
+	return s.enqueue(ctx, failed[0].JiraKey, names, attempt, notBefore, "auto_retry", now)
 }
 
-func (s *Store) enqueue(ctx context.Context, key, repo string, attempt int, notBefore time.Time, event string, now time.Time) (Job, error) {
+func (s *Store) enqueue(ctx context.Context, key string, repoNames []string, attempt int, notBefore time.Time, event string, now time.Time) ([]Job, error) {
+	if len(repoNames) == 0 {
+		return nil, errors.New("no repo to queue")
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return Job{}, err
+		return nil, err
 	}
 	defer tx.Rollback()
 
 	var st State
 	if err := tx.QueryRowContext(ctx, `SELECT state FROM tasks WHERE jira_key = ?`, key).Scan(&st); err != nil {
-		return Job{}, err
+		return nil, err
 	}
 	if st != StateApproved {
-		return Job{}, ErrInvalidTransition
+		return nil, ErrInvalidTransition
 	}
-	var active int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE jira_key = ? AND status IN (?, ?)`,
-		key, JobQueued, JobRunning).Scan(&active); err != nil {
-		return Job{}, err
-	}
-	if active > 0 {
-		return Job{}, ErrJobActive
-	}
-	var resumeOf sql.NullInt64
-	last, err := scanJob(tx.QueryRowContext(ctx, selectJob+` WHERE jira_key = ? ORDER BY id DESC LIMIT 1`, key))
-	switch {
-	case err == nil && last.RepoName == repo && last.Status == JobFailed && last.WIPSHA != "":
-		resumeOf = sql.NullInt64{Int64: last.ID, Valid: true}
-	case err != nil && !errors.Is(err, sql.ErrNoRows):
-		return Job{}, err
-	}
-	var nb sql.NullInt64
-	if !notBefore.IsZero() {
-		nb = sql.NullInt64{Int64: notBefore.Unix(), Valid: true}
-	}
-	res, err := tx.ExecContext(ctx, `INSERT INTO jobs (jira_key, repo_name, status, created_at, resume_of, attempt, not_before)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`, key, repo, JobQueued, now.Unix(), resumeOf, attempt, nb)
+	jobs, err := insertGroup(ctx, tx, key, repoNames, attempt, notBefore, now)
 	if err != nil {
-		return Job{}, err
+		return nil, err
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return Job{}, err
+	if err := addEvent(ctx, tx, key, event, strings.Join(repoNames, ","), now); err != nil {
+		return nil, err
 	}
-	if err := addEvent(ctx, tx, key, event, repo, now); err != nil {
-		return Job{}, err
-	}
-	j, err := scanJob(tx.QueryRowContext(ctx, selectJob+` WHERE id = ?`, id))
-	if err != nil {
-		return Job{}, err
-	}
-	return j, tx.Commit()
+	return jobs, tx.Commit()
 }

@@ -128,3 +128,45 @@ func TestAutoRetryBackoffAndResume(t *testing.T) {
 		t.Fatalf("manual retry without wip = %+v", j)
 	}
 }
+
+func TestJobGroups(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	now := time.Unix(1_800_000_000, 0)
+	for _, k := range []string{"X-1", "X-2"} {
+		s.Upsert(ctx, IssueInput{Key: k, Summary: k, URL: k}, now)
+		s.MarkNotified(ctx, k, 1, now)
+	}
+	_, jobs, err := s.ApproveAndEnqueueRepos(ctx, "X-1", []string{"api", "web"}, now)
+	if err != nil || len(jobs) != 2 || jobs[0].GroupID != jobs[0].ID || jobs[1].GroupID != jobs[0].ID {
+		t.Fatalf("group = %+v %v", jobs, err)
+	}
+	s.ApproveAndEnqueue(ctx, "X-2", "api", now)
+
+	claimed, ok, err := s.ClaimGroup(ctx, now)
+	if err != nil || !ok || len(claimed) != 2 || claimed[0].Status != JobRunning || claimed[1].RepoName != "web" {
+		t.Fatalf("claim = %+v %v %v", claimed, ok, err)
+	}
+	if g, _ := s.LatestGroup(ctx, "X-1"); len(g) != 2 {
+		t.Fatalf("latest group = %+v", g)
+	}
+	if _, err := s.LatestGroup(ctx, "NOPE"); !IsNotFound(err) {
+		t.Fatalf("latest group of unknown task: %v", err)
+	}
+	s.FinishJob(ctx, claimed[0].ID, JobResult{Status: JobFailed, Error: "connection reset", WIPSHA: "w1"}, now)
+	s.FinishJob(ctx, claimed[1].ID, JobResult{Status: JobFailed, Error: "connection reset"}, now)
+
+	// The auto-retry is one new group; only the repo with WIP resumes.
+	retry, err := s.AutoRetryGroup(ctx, []Job{claimed[0], claimed[1]}, true, time.Time{}, now)
+	if err != nil || len(retry) != 2 || retry[0].GroupID == claimed[0].GroupID || retry[1].GroupID != retry[0].GroupID ||
+		retry[0].ResumeOf != claimed[0].ID || retry[1].ResumeOf != 0 || retry[0].Attempt != 1 {
+		t.Fatalf("retry = %+v %v", retry, err)
+	}
+	// The X-2 job was queued first: it is claimed alone before the retry group.
+	if g, ok, _ := s.ClaimGroup(ctx, now); !ok || len(g) != 1 || g[0].JiraKey != "X-2" {
+		t.Fatalf("claim X-2 = %+v", g)
+	}
+	if g, ok, _ := s.ClaimGroup(ctx, now); !ok || len(g) != 2 || g[0].JiraKey != "X-1" {
+		t.Fatalf("claim retry = %+v", g)
+	}
+}
