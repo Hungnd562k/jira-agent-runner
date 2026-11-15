@@ -11,6 +11,8 @@ import (
 type Task struct {
 	TestCmd string
 	E2E     *E2E // nil = no browser verification for this repo
+	// ResumeOf is the interrupted job whose partial changes are already in the working tree (0 = fresh).
+	ResumeOf int64
 }
 
 // E2E describes the local web app the agent must verify in a browser.
@@ -43,6 +45,9 @@ func BuildPrompt(d jira.IssueDetail, t Task) string {
 	}
 
 	b.WriteString("\n## Job\n")
+	if t.ResumeOf > 0 {
+		fmt.Fprintf(&b, "- Continue an interrupted attempt (job %d): its partial changes are already in the working tree as uncommitted edits (see `git status` / `git diff`). Review them, keep what is right, fix what is not, and finish the job.\n", t.ResumeOf)
+	}
 	if t.TestCmd != "" {
 		fmt.Fprintf(&b, "- Test command (the runner re-runs it as evidence): `%s`\n", t.TestCmd)
 	} else {

@@ -131,6 +131,13 @@ func FooterNoRepo() string {
 func FooterQueued(repo string) string {
 	return "🕓 <b>Queued</b> — agent will work on <code>" + html.EscapeString(repo) + "</code>"
 }
+func FooterRetrying(repo string, attempt int, at string, resume bool) string {
+	s := fmt.Sprintf("🔁 <b>Auto-retry #%d</b> on <code>%s</code> at %s", attempt, html.EscapeString(repo), html.EscapeString(at))
+	if resume {
+		s += " — continuing the partial work"
+	}
+	return s
+}
 func FooterRunning(repo string) string {
 	return "🤖 <b>Agent running</b> on <code>" + html.EscapeString(repo) + "</code>…"
 }

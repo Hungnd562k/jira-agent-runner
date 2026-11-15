@@ -33,6 +33,9 @@ func (w *Worker) Publish(ctx context.Context, jobID int64) error {
 	if job.MRURL != "" {
 		return fmt.Errorf("job %d already has an MR: %s", jobID, job.MRURL)
 	}
+	if job.WIPSHA != "" {
+		return fmt.Errorf("job %d only has partial (WIP) work on %s — retry the job instead of publishing it", jobID, job.Branch)
+	}
 	if job.Branch == "" {
 		return fmt.Errorf("job %d has no branch (the agent never ran)", jobID)
 	}
@@ -65,7 +68,11 @@ func (w *Worker) Publish(ctx context.Context, jobID int64) error {
 		return fmt.Errorf("local branch %s not found in %s", job.Branch, repo.Path)
 	}
 	rep.DiffStat, _ = g.Run(ctx, "diff", "--stat", "origin/"+repo.BaseBranch+"..."+job.Branch)
-	if _, err := g.Run(ctx, "push", "origin", job.Branch); err != nil {
+	pctx, cancel := w.netCtx(ctx)
+	_, err = g.Run(pctx, "push", "origin", job.Branch)
+	err = netErr(pctx, err)
+	cancel()
+	if err != nil {
 		return fmt.Errorf("push: %w", err)
 	}
 	log := w.Log.With("job", job.ID, "key", job.JiraKey, "repo", job.RepoName)

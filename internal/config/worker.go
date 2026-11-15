@@ -31,6 +31,11 @@ type WorkerConfig struct {
 	PipelineStartTimeout time.Duration
 	JiraHandoverStatus   string
 	JiraResolution       string
+
+	// Resilience: automatic retries of transient (network/API) job failures.
+	JobAutoRetries int
+	JobRetryDelay  time.Duration
+	GitNetTimeout  time.Duration
 }
 
 // LoadWorker reads worker settings. GitLab settings are required unless requireGitLab is false (--no-push).
@@ -67,6 +72,15 @@ func LoadWorker(requireGitLab bool) (*WorkerConfig, error) {
 		errs = append(errs, err)
 	}
 	if w.PipelineStartTimeout, err = durationEnv("PIPELINE_START_TIMEOUT", "15m"); err != nil {
+		errs = append(errs, err)
+	}
+	if w.JobAutoRetries, err = strconv.Atoi(getenv("JOB_AUTO_RETRIES", "3")); err != nil || w.JobAutoRetries < 0 {
+		errs = append(errs, fmt.Errorf("JOB_AUTO_RETRIES must be an integer >= 0"))
+	}
+	if w.JobRetryDelay, err = durationEnv("JOB_RETRY_DELAY", "2m"); err != nil {
+		errs = append(errs, err)
+	}
+	if w.GitNetTimeout, err = durationEnv("GIT_NET_TIMEOUT", "5m"); err != nil {
 		errs = append(errs, err)
 	}
 	if w.E2ECredentialsFile, err = filepath.Abs(getenv("E2E_CREDENTIALS_FILE", ".secrets/credentials.json")); err != nil {

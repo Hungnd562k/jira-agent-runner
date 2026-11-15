@@ -39,3 +39,13 @@ func TestArgs(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildPromptResume(t *testing.T) {
+	d := jira.IssueDetail{Issue: jira.Issue{Key: "X-1", Summary: "Crash"}, Type: "Bug"}
+	if p := BuildPrompt(d, Task{}); strings.Contains(p, "interrupted attempt") {
+		t.Error("fresh job mentions a resume")
+	}
+	if p := BuildPrompt(d, Task{ResumeOf: 7}); !strings.Contains(p, "interrupted attempt (job 7)") {
+		t.Errorf("resume prompt = %s", p)
+	}
+}

@@ -91,3 +91,40 @@ func TestEnqueueRetry(t *testing.T) {
 		t.Fatalf("latest = %+v", latest)
 	}
 }
+
+func TestAutoRetryBackoffAndResume(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	now := time.Unix(1_800_000_000, 0)
+	s.Upsert(ctx, IssueInput{Key: "X-1", Summary: "s", URL: "u"}, now)
+	s.MarkNotified(ctx, "X-1", 1, now)
+	_, first, _ := s.ApproveAndEnqueue(ctx, "X-1", "api", now)
+	s.ClaimJob(ctx, now)
+	if err := s.SetJobAgent(ctx, first.ID, 4242, "boot"); err != nil {
+		t.Fatal(err)
+	}
+	failed, err := s.FinishJob(ctx, first.ID, JobResult{Status: JobFailed, Error: "net", WIPSHA: "abc"}, now)
+	if err != nil || failed.WIPSHA != "abc" || failed.AgentPGID != 0 {
+		t.Fatalf("finish = %+v %v", failed, err)
+	}
+
+	retry, err := s.AutoRetry(ctx, failed, true, now.Add(time.Minute), now)
+	if err != nil || retry.Attempt != 1 || retry.ResumeOf != first.ID || !retry.NotBefore.Equal(now.Add(time.Minute)) {
+		t.Fatalf("retry = %+v %v", retry, err)
+	}
+	if _, err := s.AutoRetry(ctx, failed, true, now, now); !errors.Is(err, ErrJobActive) {
+		t.Fatalf("second retry while queued: %v", err)
+	}
+	if _, ok, _ := s.ClaimJob(ctx, now.Add(30*time.Second)); ok {
+		t.Fatal("claimed before not_before")
+	}
+	if j, ok, _ := s.ClaimJob(ctx, now.Add(time.Minute)); !ok || j.ID != retry.ID {
+		t.Fatalf("claim at not_before = %+v %v", j, ok)
+	}
+	s.FinishJob(ctx, retry.ID, JobResult{Status: JobFailed, Error: "x"}, now)
+
+	// No WIP on the latest failure, or another repo: a fresh start.
+	if j, _ := s.Enqueue(ctx, "X-1", "api", now); j.ResumeOf != 0 || j.Attempt != 0 {
+		t.Fatalf("manual retry without wip = %+v", j)
+	}
+}

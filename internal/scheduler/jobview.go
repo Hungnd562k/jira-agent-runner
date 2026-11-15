@@ -11,6 +11,9 @@ import (
 func JobFooter(j store.Job) string {
 	switch j.Status {
 	case store.JobQueued:
+		if !j.NotBefore.IsZero() {
+			return telegram.FooterRetrying(j.RepoName, j.Attempt, j.NotBefore.Format("15:04"), j.ResumeOf > 0)
+		}
 		return telegram.FooterQueued(j.RepoName)
 	case store.JobRunning:
 		return telegram.FooterRunning(j.RepoName)
