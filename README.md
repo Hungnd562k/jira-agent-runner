@@ -31,3 +31,35 @@ Behavior and configuration: [docs/SPEC.md](docs/SPEC.md).
 6. On Telegram: **Fix it** → pick repo → the notice shows progress; a report reply gives branch/MR, tests and the agent's root-cause summary. Finished jobs offer **Retry** / **Other repo**. Full report: `data/jobs/<id>/report.md`.
 
 Worktrees are created next to each clone (`<parent>/.agent-<repo>-<KEY>-j<id>`) so relative references to sibling repos build; they are removed after each job.
+
+## Updating after a change
+Two parts run separately and both must be rebuilt: the **notifier** in Docker (container `jira-agent-runner`) and the **worker** on the host (systemd user unit `jira-agent-worker`, runs `bin/runner`).
+
+```bash
+cd ~/private/jira-agent-runner
+git switch main && git pull --ff-only   # after the PR is merged
+make test                               # optional, recommended
+
+make up                                 # notifier: rebuild image + restart container
+make build                              # worker: rebuild bin/runner
+systemctl --user restart jira-agent-worker
+```
+
+Check that it is running:
+
+```bash
+docker compose ps                          # notifier: "Up ... (healthy)"
+make logs                                  # notifier logs (Ctrl+C to quit)
+systemctl --user status jira-agent-worker  # worker: "active (running)"
+journalctl --user -u jira-agent-worker -f  # worker logs
+```
+
+The worker's `worker starting` log line lists the effective settings (`auto_retries`, `retry_delay`, `git_net_timeout`, …), so you can confirm the new build is live.
+
+Notes:
+- **Restarting the worker mid-job is safe**: the job saves its partial work (WIP) and is requeued without using a retry attempt. When nothing is urgent, wait for the running job to finish.
+- **`.env` only changed**: no rebuild needed, just restart: `docker compose up -d` (notifier) and `systemctl --user restart jira-agent-worker` (worker).
+- **`repos.json` changed**: restart both; the notifier and the worker each read it.
+- **Never run `make run` / `make worker` next to the services**: one poller per bot token, one worker only.
+- **DB migrations apply automatically**: whichever process opens the DB first.
+- **Trying a build without push/MR**: `systemctl --user stop jira-agent-worker`, then `make worker-local`; afterwards `systemctl --user start jira-agent-worker`.
