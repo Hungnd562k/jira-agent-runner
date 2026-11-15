@@ -27,8 +27,16 @@ Behavior and configuration: [docs/SPEC.md](docs/SPEC.md).
 2. Add `GITLAB_BASE_URL` / `GITLAB_TOKEN` (`api` scope) to `.env`.
 3. `make up` (notifier, reloads `repos.json`) and on the host `make worker-local` (local branch only) or `make worker` (push + Draft MR + Jira comment). For a permanent setup use `deploy/jira-agent-worker.service`.
 4. Web repos: add an `e2e` block to the repo in `repos.json` and put web logins in `.secrets/credentials.json` (`chmod 600`, format: `credentials.example.json`), or point `E2E_CREDENTIALS_FILE` to an existing file with the same `profiles` format. Set `E2E_NODE_PATH` to a `node_modules` that has `playwright`. The agent then verifies the fix in a local browser; screenshots are attached to the Jira comment.
-5. Shared dev branch: set `"auto_merge": true` and `"handover_branch": "test"` on the repo. A fix whose tests and E2E pass is merged into dev ("chờ bàn giao"). When the queue is idle the bot asks to hand over: **Có** creates, approves and merges dev → test, watches CI/CD and, on success, resolves each ticket and assigns it back to its reporter.
-6. On Telegram: **Fix it** → pick repo → the notice shows progress; a report reply gives branch/MR, tests and the agent's root-cause summary. Finished jobs offer **Retry** / **Other repo**. Full report: `data/jobs/<id>/report.md`.
+5. Scope comment: `make up` creates `scope.json` from `scope.example.json`. Before **Fix it**, comment on the ticket (the bot sends this template, prefilled, when it is missing):
+   ```
+   @CLAUDE/CODEX,
+   repo_dependencies: cd-host-suite, cd-boclient-web
+   specs: <Dành cho feats, yêu cầu sửa đổi>
+   hints: <gợi ý giúp agent khoanh vùng nhanh hơn>
+   ```
+   Change the marker, field names, descriptions or allowed `authors` in `scope.json` — no code change (restart notifier + worker).
+6. Shared dev branch: set `"auto_merge": true` and `"handover_branch": "test"` on the repo. A fix whose tests and E2E pass is merged into dev ("chờ bàn giao"). When the queue is idle the bot asks to hand over: **Có** creates, approves and merges dev → test, watches CI/CD and, on success, resolves each ticket and assigns it back to its reporter.
+7. On Telegram: **Fix it** → the bot reads the scope comment and queues one agent run over every repo in `repo_dependencies` (no comment → it replies with the template to paste) → the notice shows progress per repo; one report reply per changed repo gives branch/MR, tests and the agent's root-cause summary. Finished jobs offer **Retry** (re-reads the comment, skips repos already merged). Full report: `data/jobs/<id>/report.md`.
 
 Worktrees are created next to each clone (`<parent>/.agent-<repo>-<KEY>-j<id>`) so relative references to sibling repos build; they are removed after each job.
 
@@ -59,7 +67,7 @@ The worker's `worker starting` log line lists the effective settings (`auto_retr
 Notes:
 - **Restarting the worker mid-job is safe**: the job saves its partial work (WIP) and is requeued without using a retry attempt. When nothing is urgent, wait for the running job to finish.
 - **`.env` only changed**: no rebuild needed, just restart: `docker compose up -d` (notifier) and `systemctl --user restart jira-agent-worker` (worker).
-- **`repos.json` changed**: restart both; the notifier and the worker each read it.
+- **`repos.json` or `scope.json` changed**: restart both; the notifier and the worker each read them.
 - **Never run `make run` / `make worker` next to the services**: one poller per bot token, one worker only.
 - **DB migrations apply automatically**: whichever process opens the DB first.
 - **Trying a build without push/MR**: `systemctl --user stop jira-agent-worker`, then `make worker-local`; afterwards `systemctl --user start jira-agent-worker`.

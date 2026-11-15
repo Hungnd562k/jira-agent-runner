@@ -14,9 +14,7 @@ const (
 	ActSnoozeMenu = "snz"  // snz:<KEY>            → show duration choices
 	ActSnooze     = "snz"  // snz:<KEY>:<duration> → snooze
 	ActBack       = "back" // back:<KEY>           → main keyboard
-	ActRepo       = "repo" // repo:<KEY>:<index>   → approve + queue agent on that repo
-	ActRetry      = "rty"  // rty:<KEY>            → re-run the agent on the last job's repo
-	ActOtherRepo  = "orp"  // orp:<KEY>            → pick another repo for a new job
+	ActRetry      = "rty"  // rty:<KEY>            → re-read the scope comment and re-run the agent
 
 	// Handover callbacks carry the handover id in Key.
 	ActHandoverYes     = "hoy" // hoy:<id> → create + approve + merge dev → test MRs
@@ -26,10 +24,9 @@ const (
 
 // Callback is a parsed callback_data.
 type Callback struct {
-	Action    string
-	Key       string
-	Snooze    time.Duration // set only for snz:<KEY>:<d>
-	RepoIndex int           // set only for repo:<KEY>:<i>
+	Action string
+	Key    string
+	Snooze time.Duration // set only for snz:<KEY>:<d>
 }
 
 // ParseCallback decodes callback_data produced by this package.
@@ -42,7 +39,7 @@ func ParseCallback(data string) (Callback, error) {
 	switch {
 	case cb.Action == ActFix && len(parts) == 2, cb.Action == ActBack && len(parts) == 2,
 		cb.Action == ActSnoozeMenu && len(parts) == 2,
-		cb.Action == ActRetry && len(parts) == 2, cb.Action == ActOtherRepo && len(parts) == 2,
+		cb.Action == ActRetry && len(parts) == 2,
 		cb.Action == ActHandoverYes && len(parts) == 2, cb.Action == ActHandoverLater && len(parts) == 2,
 		cb.Action == ActHandoverRewatch && len(parts) == 2:
 		return cb, nil
@@ -52,13 +49,6 @@ func ParseCallback(data string) (Callback, error) {
 			return Callback{}, fmt.Errorf("bad snooze duration in %q", data)
 		}
 		cb.Snooze = d
-		return cb, nil
-	case cb.Action == ActRepo && len(parts) == 3:
-		i, err := strconv.Atoi(parts[2])
-		if err != nil || i < 0 {
-			return Callback{}, fmt.Errorf("bad repo index in %q", data)
-		}
-		cb.RepoIndex = i
 		return cb, nil
 	}
 	return Callback{}, fmt.Errorf("unknown callback %q", data)
@@ -81,22 +71,10 @@ func SnoozeKeyboard(key string, choices []time.Duration) Keyboard {
 	return Keyboard{row, {{Text: "« Back", CallbackData: ActBack + ":" + key}}}
 }
 
-// RepoKeyboard lets the user pick which repo the agent should work on (index-based
-// callback data keeps it under 64 bytes regardless of repo name length).
-func RepoKeyboard(key string, names []string) Keyboard {
-	kb := make(Keyboard, 0, len(names)+1)
-	for i, n := range names {
-		kb = append(kb, []InlineButton{{Text: "📦 " + n, CallbackData: fmt.Sprintf("%s:%s:%d", ActRepo, key, i)}})
-	}
-	return append(kb, []InlineButton{{Text: "« Back", CallbackData: ActBack + ":" + key}})
-}
-
-// JobKeyboard is shown on an approved notice once its job has finished.
+// JobKeyboard is shown on an approved notice once its job group has finished. Retry re-reads
+// the scope comment, so editing the comment on Jira changes which repos are worked on.
 func JobKeyboard(key string) Keyboard {
-	return Keyboard{{
-		{Text: "🔁 Retry", CallbackData: ActRetry + ":" + key},
-		{Text: "📦 Other repo", CallbackData: ActOtherRepo + ":" + key},
-	}}
+	return Keyboard{{{Text: "🔁 Retry", CallbackData: ActRetry + ":" + key}}}
 }
 
 // HandoverKeyboard asks whether to merge dev → test and hand over now.
@@ -143,6 +121,9 @@ func FooterRunning(repo string) string {
 }
 func FooterFailed(repo, reason string) string {
 	return "❌ <b>Agent failed</b> on <code>" + html.EscapeString(repo) + "</code>: " + html.EscapeString(reason)
+}
+func FooterUnchanged(repo, note string) string {
+	return "➖ <code>" + html.EscapeString(repo) + "</code>: " + html.EscapeString(note)
 }
 func FooterDone(repo, mrURL, branch string, testsPassed *bool) string {
 	tests := "tests not run"

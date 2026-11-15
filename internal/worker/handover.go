@@ -508,7 +508,7 @@ func (w *Worker) finishSucceeded(ctx context.Context, log *slog.Logger, h store.
 	w.handoverReply(ctx, h, b.String(), nil)
 	for _, j := range h.Jobs {
 		if fresh, err := w.Store.GetJob(ctx, j.ID); err == nil {
-			w.updateNotice(ctx, fresh)
+			w.updateNotice(ctx, fresh.JiraKey)
 		}
 	}
 	log.Info("handover delivered", "tickets", len(lines))

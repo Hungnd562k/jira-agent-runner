@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/Hungnd562k/jira-agent-runner/internal/jira"
 	"github.com/Hungnd562k/jira-agent-runner/internal/repos"
 	"github.com/Hungnd562k/jira-agent-runner/internal/scheduler"
+	"github.com/Hungnd562k/jira-agent-runner/internal/scope"
 	"github.com/Hungnd562k/jira-agent-runner/internal/store"
 	"github.com/Hungnd562k/jira-agent-runner/internal/telegram"
 )
@@ -97,6 +99,7 @@ type Worker struct {
 	Comment     Commenter // optional: comment on the Jira issue once an MR exists
 	Resolver    Resolver  // optional: resolve + reassign issues after a successful handover
 	Handover    HandoverConfig
+	Scope       scope.Format // maintainer's scope comment: specs/hints go into the prompt
 	NoPush      bool
 	Claude      agent.ClaudeSpec // Bin, MaxBudgetUSD, Model, Timeout; Dir/Prompt/Tools/LogPath set per job
 	TestTimeout time.Duration
@@ -157,168 +160,297 @@ func (w *Worker) Run(ctx context.Context) error {
 	return nil
 }
 
-// RunOnce claims and processes one job. did=false when the queue was empty.
+// RunOnce claims and processes one job group (one job per repo of the scope, one agent run).
+// did=false when the queue was empty.
 func (w *Worker) RunOnce(ctx context.Context) (did bool, err error) {
-	job, ok, err := w.Store.ClaimJob(ctx, w.Now())
+	jobs, ok, err := w.Store.ClaimGroup(ctx, w.Now())
 	if err != nil || !ok {
 		return false, err
 	}
-	log := w.Log.With("job", job.ID, "key", job.JiraKey, "repo", job.RepoName)
-	log.Info("job started")
-	w.updateNotice(ctx, job)
+	key := jobs[0].JiraKey
+	log := w.Log.With("group", jobs[0].GroupID, "key", key, "repos", repoNames(jobs))
+	log.Info("job started", "jobs", len(jobs))
+	w.updateNotice(ctx, key)
 
-	rep := &Report{}
-	res, detail := w.process(ctx, log, job, rep)
-	if res.Status == "" {
-		res.Status = store.JobSucceeded
-	}
-	stopped := ctx.Err() != nil && res.Status == store.JobFailed
-	if stopped {
-		res.Error = "interrupted (worker stopped): " + res.Error
-	}
-	// Persist the outcome even if ctx was cancelled mid-run.
-	done, ferr := w.Store.FinishJob(context.WithoutCancel(ctx), job.ID, res, w.Now())
-	if ferr != nil {
-		return true, ferr
-	}
-	log.Info("job finished", "status", done.Status, "mr", done.MRURL, "err", done.Error)
+	runs := w.process(ctx, log, jobs)
+	stopped := ctx.Err() != nil
+	// Persist the outcomes even if ctx was cancelled mid-run.
 	bg := context.WithoutCancel(ctx)
-	w.updateNotice(bg, done)
-	if _, retried := w.maybeRetry(bg, log, done, stopped); retried {
-		return true, nil
+	done := make([]store.Job, len(runs))
+	for i, r := range runs {
+		if r.res.Status == "" {
+			r.res.Status = store.JobSucceeded
+		}
+		if stopped && r.res.Status == store.JobFailed {
+			r.res.Error = "interrupted (worker stopped): " + r.res.Error
+		}
+		d, ferr := w.Store.FinishJob(bg, r.job.ID, r.res, w.Now())
+		if ferr != nil {
+			return true, ferr
+		}
+		done[i] = d
+		log.Info("job finished", "job", d.ID, "repo", d.RepoName, "status", d.Status, "mr", d.MRURL, "err", d.Error)
 	}
-	if done.Status == store.JobFailed && detail != "" {
-		w.reply(bg, done.JiraKey, "<pre>"+html.EscapeString(truncate(detail, 3000))+"</pre>")
+	w.updateNotice(bg, key)
+	retried := w.maybeRetry(bg, log, done, stopped)
+	shown := map[string]bool{}
+	for i, d := range done {
+		if retried[d.ID] {
+			continue
+		}
+		if det := runs[i].detail; d.Status == store.JobFailed && det != "" && !shown[det] {
+			shown[det] = true // one agent run: show its output once, not once per repo
+			w.reply(bg, key, "<pre>"+html.EscapeString(truncate(det, 3000))+"</pre>")
+		}
+		if d.WIPSHA != "" {
+			w.reply(bg, key, wipText(d))
+		}
+		w.publish(bg, log, d, runs[i].rep)
 	}
-	if done.WIPSHA != "" {
-		w.reply(bg, done.JiraKey, wipText(done))
-	}
-	w.publish(bg, log, done, rep)
 	return true, nil
 }
 
-// process runs the pipeline; detail is extra log text shown on failure.
-func (w *Worker) process(ctx context.Context, log *slog.Logger, job store.Job, rep *Report) (res store.JobResult, detail string) {
-	fail := func(format string, a ...any) (store.JobResult, string) {
-		return store.JobResult{Status: store.JobFailed, Error: fmt.Sprintf(format, a...)}, detail
-	}
+// jobRun is one job (= one repo) of the group being processed.
+type jobRun struct {
+	job     store.Job
+	repo    repos.Repo
+	wt      *agent.Worktree
+	jobDir  string
+	branch  string
+	e2e     *agent.E2E
+	changed bool
+	res     store.JobResult
+	detail  string // extra log text shown on failure
+	rep     *Report
+}
 
-	repo, ok := w.Repos.Find(job.JiraKey, job.RepoName)
-	if !ok {
-		return fail("repo %q not found in repos.json", job.RepoName)
-	}
-	issue, err := w.Jira.GetIssue(ctx, job.JiraKey)
-	if err != nil {
-		return fail("load issue: %v", err)
-	}
-	rep.Key, rep.Summary, rep.IssueURL, rep.Repo = issue.Key, issue.Summary, issue.URL, repo
+func (r *jobRun) failed() bool { return r.res.Status == store.JobFailed }
 
-	jobDir := filepath.Join(w.JobsDir, strconv.FormatInt(job.ID, 10))
-	rep.JobDir = jobDir
-	if err := os.MkdirAll(jobDir, 0o755); err != nil {
-		return fail("create job dir: %v", err)
-	}
+func (r *jobRun) fail(format string, a ...any) {
+	r.res = store.JobResult{Status: store.JobFailed, Error: fmt.Sprintf(format, a...)}
+}
 
-	branch := fmt.Sprintf("agent/%s-j%d", job.JiraKey, job.ID)
-	root, name := worktreeLocation(w.WorktreeRoot, repo.Path, job)
-	nctx, cancel := w.netCtx(ctx)
-	wt, err := agent.NewWorktree(nctx, repo.Path, root, name, branch, repo.BaseBranch)
-	err = netErr(nctx, err)
-	cancel()
-	if err != nil {
-		return fail("prepare worktree: %v", err)
+// process runs the pipeline for a group: worktrees for every repo, one agent session over all
+// of them, then tests → commit → push → MR per repo that changed.
+func (w *Worker) process(ctx context.Context, log *slog.Logger, jobs []store.Job) []*jobRun {
+	runs := make([]*jobRun, len(jobs))
+	for i, j := range jobs {
+		runs[i] = &jobRun{job: j, rep: &Report{}}
 	}
-	// Git-ignored agent guidance (CLAUDE.md/AGENTS.md) only exists in the main clone.
-	agent.CopyIgnoredFiles(repo.Path, wt.Dir, "CLAUDE.md", "AGENTS.md", "CLAUDE.local.md")
-	defer func() {
-		bg := context.WithoutCancel(ctx)
-		// A failed run keeps the agent's uncommitted edits as a local WIP commit, so a retry
-		// (automatic or manual) continues from them instead of starting over.
-		if res.Status == store.JobFailed {
-			if sha, err := wt.SaveWIP(bg, wipMessage(job, res.Error)); err != nil {
-				log.Warn("save wip", "err", err)
-			} else if sha != "" {
-				res.WIPSHA = sha
-				log.Info("partial work saved", "sha", shortSHA(sha))
+	failAll := func(format string, a ...any) []*jobRun {
+		for _, r := range runs {
+			if !r.failed() {
+				r.fail(format, a...)
 			}
 		}
-		if err := wt.Remove(bg); err != nil {
-			log.Warn("remove worktree", "err", err)
+		return runs
+	}
+
+	for _, r := range runs {
+		repo, ok := w.Repos.Find(r.job.JiraKey, r.job.RepoName)
+		if !ok {
+			return failAll("repo %q not found in repos.json", r.job.RepoName)
+		}
+		r.repo = repo
+	}
+	key := jobs[0].JiraKey
+	issue, err := w.Jira.GetIssue(ctx, key)
+	if err != nil {
+		return failAll("load issue: %v", err)
+	}
+	for _, r := range runs {
+		r.rep.Key, r.rep.Summary, r.rep.IssueURL, r.rep.Repo = issue.Key, issue.Summary, issue.URL, r.repo
+	}
+
+	defer func() {
+		bg := context.WithoutCancel(ctx)
+		for _, r := range runs {
+			if r.wt == nil {
+				continue
+			}
+			// A failed run keeps the agent's uncommitted edits as a local WIP commit, so a retry
+			// (automatic or manual) continues from them instead of starting over.
+			if r.failed() {
+				if sha, err := r.wt.SaveWIP(bg, wipMessage(r.job, r.res.Error)); err != nil {
+					log.Warn("save wip", "repo", r.repo.Name, "err", err)
+				} else if sha != "" {
+					r.res.WIPSHA = sha
+					log.Info("partial work saved", "repo", r.repo.Name, "sha", shortSHA(sha))
+				}
+			}
+			if err := r.wt.Remove(bg); err != nil {
+				log.Warn("remove worktree", "repo", r.repo.Name, "err", err)
+			}
 		}
 	}()
-	if err := w.Store.SetJobBranch(ctx, job.ID, branch); err != nil {
-		return fail("save branch: %v", err)
-	}
 
 	spec := w.Claude
-	spec.Dir = wt.Dir
-	spec.AllowedTools = repo.AllowedTools
-	spec.LogPath = filepath.Join(jobDir, "agent.json")
-	task := agent.Task{TestCmd: repo.TestCmd, ResumeOf: w.resume(ctx, log, wt, job, repo.BaseBranch)}
-	if repo.E2E != nil {
-		e2e, err := w.prepareE2E(log, &spec, repo, jobDir)
-		if err != nil {
-			return fail("prepare e2e: %v", err)
+	task := agent.Task{}
+	if sc := w.scopeFor(issue); sc != nil {
+		task.ScopeAuthor = sc.Author
+		for _, n := range sc.Notes {
+			task.Scope = append(task.Scope, agent.ScopeNote{Key: n.Key, Description: n.Description, Value: n.Value})
 		}
-		task.E2E = e2e
+	} else {
+		log.Warn("no valid scope comment on the issue any more; running on the queued repos without specs/hints")
 	}
-	spec.SystemPrompt = agent.Rules(task.E2E != nil)
+	for i, r := range runs {
+		r.jobDir = filepath.Join(w.JobsDir, strconv.FormatInt(r.job.ID, 10))
+		r.rep.JobDir = r.jobDir
+		if err := os.MkdirAll(r.jobDir, 0o755); err != nil {
+			return failAll("create job dir: %v", err)
+		}
+		r.branch = fmt.Sprintf("agent/%s-j%d", r.job.JiraKey, r.job.ID)
+		root, name := worktreeLocation(w.WorktreeRoot, r.repo.Path, r.job)
+		nctx, cancel := w.netCtx(ctx)
+		wt, err := agent.NewWorktree(nctx, r.repo.Path, root, name, r.branch, r.repo.BaseBranch)
+		err = netErr(nctx, err)
+		cancel()
+		if err != nil {
+			return failAll("prepare worktree %s: %v", r.repo.Name, err)
+		}
+		r.wt = wt
+		// Git-ignored agent guidance (CLAUDE.md/AGENTS.md) only exists in the main clone.
+		agent.CopyIgnoredFiles(r.repo.Path, wt.Dir, "CLAUDE.md", "AGENTS.md", "CLAUDE.local.md")
+		if err := w.Store.SetJobBranch(ctx, r.job.ID, r.branch); err != nil {
+			return failAll("save branch: %v", err)
+		}
+		rt := agent.RepoTask{Name: r.repo.Name, Dir: wt.Dir, TestCmd: r.repo.TestCmd,
+			ResumeOf: w.resume(ctx, log, wt, r.job, r.repo.BaseBranch)}
+		if r.repo.E2E != nil {
+			e2e, err := w.prepareE2E(log, &spec, r.repo, r.jobDir, !task.HasE2E())
+			if err != nil {
+				return failAll("prepare e2e: %v", err)
+			}
+			r.e2e, rt.E2E = e2e, e2e
+		}
+		spec.AllowedTools = appendNew(spec.AllowedTools, r.repo.AllowedTools...)
+		if i == 0 {
+			spec.Dir = wt.Dir
+		} else {
+			spec.AddDirs = append(spec.AddDirs, wt.Dir)
+		}
+		task.Repos = append(task.Repos, rt)
+	}
+
+	spec.LogPath = filepath.Join(runs[0].jobDir, "agent.json")
+	spec.SystemPrompt = agent.Rules(task.HasE2E())
 	spec.Prompt = agent.BuildPrompt(issue, task)
 	spec.OnStart = func(pgid int) {
-		if err := w.Store.SetJobAgent(context.WithoutCancel(ctx), job.ID, pgid, w.BootID); err != nil {
-			log.Warn("record agent pgid", "err", err)
+		for _, r := range runs {
+			if err := w.Store.SetJobAgent(context.WithoutCancel(ctx), r.job.ID, pgid, w.BootID); err != nil {
+				log.Warn("record agent pgid", "err", err)
+			}
 		}
 	}
-	log.Info("agent running", "worktree", wt.Dir, "resume_of", task.ResumeOf)
+	log.Info("agent running", "dir", spec.Dir, "extra_dirs", len(spec.AddDirs))
 	cr, err := agent.RunClaude(ctx, spec)
+	// Every job dir gets the agent log, so --publish-job works per repo.
+	for _, r := range runs[1:] {
+		copyFile(spec.LogPath, filepath.Join(r.jobDir, "agent.json"))
+	}
 	if err != nil {
-		return fail("%v", err)
+		return failAll("%v", err)
 	}
 	log.Info("agent done", "cost_usd", cr.CostUSD, "turns", cr.NumTurns)
-	rep.Agent, rep.Branch = cr, branch
-	if task.E2E != nil {
-		rep.Evidence = loadEvidence(task.E2E.EvidenceDir)
-		log.Info("e2e evidence", "status", rep.Evidence.Line())
-	}
 
-	changed, err := wt.HasChanges(ctx)
-	if err != nil {
-		return fail("git status: %v", err)
-	}
-	if !changed {
-		detail = cr.Text
-		return fail("agent made no changes")
-	}
-
-	if repo.TestCmd != "" {
-		tr, err := agent.RunTests(ctx, wt.Dir, repo.TestCmd, filepath.Join(jobDir, "test.log"), w.TestTimeout)
-		if err != nil {
-			return fail("%v", err)
+	anyChange := false
+	for _, r := range runs {
+		r.rep.Agent, r.rep.Branch = cr, r.branch
+		if r.e2e != nil {
+			r.rep.Evidence = loadEvidence(r.e2e.EvidenceDir)
+			log.Info("e2e evidence", "repo", r.repo.Name, "status", r.rep.Evidence.Line())
 		}
-		rep.Tests = &tr
-		res.TestsPassed = &tr.Passed
+		changed, err := r.wt.HasChanges(ctx)
+		if err != nil {
+			r.fail("git status: %v", err)
+			continue
+		}
+		r.changed = changed
+		anyChange = anyChange || changed
+	}
+	for _, r := range runs {
+		switch {
+		case r.failed():
+		case !r.changed && !anyChange:
+			r.fail("agent made no changes")
+			r.detail = cr.Text
+		case !r.changed:
+			// Another repo of the scope carried the fix: nothing to commit here.
+			r.res = store.JobResult{Status: store.JobSucceeded, Error: "no changes needed in this repo"}
+			r.rep.Branch = "" // nothing to report or publish for this repo
+		default:
+			w.deliverRepo(ctx, log, issue, r)
+		}
+	}
+	return runs
+}
+
+// deliverRepo runs tests, commits and (unless NoPush) pushes and opens/merges the MR of one
+// repo the agent changed. Failures only affect this repo's job.
+func (w *Worker) deliverRepo(ctx context.Context, log *slog.Logger, issue jira.IssueDetail, r *jobRun) {
+	log = log.With("job", r.job.ID, "repo", r.repo.Name)
+	if r.repo.TestCmd != "" {
+		tr, err := agent.RunTests(ctx, r.wt.Dir, r.repo.TestCmd, filepath.Join(r.jobDir, "test.log"), w.TestTimeout)
+		if err != nil {
+			r.fail("%v", err)
+			return
+		}
+		r.rep.Tests = &tr
+		r.res.TestsPassed = &tr.Passed
 		log.Info("tests done", "passed", tr.Passed, "exit", tr.ExitCode)
 	}
-
-	stat := wt.DiffStat(ctx)
-	rep.DiffStat = stat
-	if err := wt.Commit(ctx, commitMessage(issue)); err != nil {
-		return fail("commit: %v", err)
+	r.rep.DiffStat = r.wt.DiffStat(ctx)
+	if err := r.wt.Commit(ctx, commitMessage(issue)); err != nil {
+		r.fail("commit: %v", err)
+		return
 	}
 	if w.NoPush || w.MR == nil {
-		return res, ""
+		return
 	}
-
 	pctx, cancel := w.netCtx(ctx)
-	err = netErr(pctx, wt.Push(pctx))
+	err := netErr(pctx, r.wt.Push(pctx))
 	cancel()
 	if err != nil {
-		return fail("push: %v", err)
+		r.fail("push: %v", err)
+		return
 	}
-	if err := w.openAndMerge(ctx, log, issue, repo, branch, rep, &res); err != nil {
-		return fail("%v", err)
+	if err := w.openAndMerge(ctx, log, issue, r.repo, r.branch, r.rep, &r.res); err != nil {
+		r.fail("%v", err)
 	}
-	return res, ""
+}
+
+// scopeFor re-reads the maintainer's scope comment for the prompt (specs, hints).
+func (w *Worker) scopeFor(issue jira.IssueDetail) *scope.Scope {
+	var names []string
+	for _, r := range w.Repos.For(issue.Key) {
+		names = append(names, r.Name)
+	}
+	return w.Scope.Find(issue.Comments, names).Scope
+}
+
+func repoNames(jobs []store.Job) string {
+	names := make([]string, len(jobs))
+	for i, j := range jobs {
+		names[i] = j.RepoName
+	}
+	return strings.Join(names, ",")
+}
+
+// appendNew appends the items of add that are not in list yet.
+func appendNew(list []string, add ...string) []string {
+	for _, a := range add {
+		if !slices.Contains(list, a) {
+			list = append(list, a)
+		}
+	}
+	return list
+}
+
+func copyFile(from, to string) {
+	if b, err := os.ReadFile(from); err == nil {
+		_ = os.WriteFile(to, b, 0o644)
+	}
 }
 
 // resume applies the WIP of the job this one continues; it returns that job's id, or 0 when
@@ -392,14 +524,18 @@ func (w *Worker) openAndMerge(ctx context.Context, log *slog.Logger, issue jira.
 	return nil
 }
 
-// updateNotice re-renders the task's latest notice with the job's progress.
-func (w *Worker) updateNotice(ctx context.Context, j store.Job) {
-	t, err := w.Store.Get(ctx, j.JiraKey)
+// updateNotice re-renders the task's latest notice with its latest job group's progress.
+func (w *Worker) updateNotice(ctx context.Context, key string) {
+	t, err := w.Store.Get(ctx, key)
 	if err != nil || t.TGMessageID == 0 {
 		return
 	}
-	if err := w.TG.EditMessage(ctx, w.ChatID, t.TGMessageID, scheduler.ApprovedText(t, &j), scheduler.JobKeyboard(t, &j)); err != nil && !telegram.IsNotModified(err) {
-		w.Log.Warn("edit notice", "key", j.JiraKey, "err", err)
+	jobs, err := w.Store.LatestGroup(ctx, key)
+	if err != nil {
+		return
+	}
+	if err := w.TG.EditMessage(ctx, w.ChatID, t.TGMessageID, scheduler.ApprovedText(t, jobs), scheduler.JobKeyboard(t, jobs)); err != nil && !telegram.IsNotModified(err) {
+		w.Log.Warn("edit notice", "key", key, "err", err)
 	}
 }
 
@@ -458,7 +594,8 @@ var e2eTools = []string{"Bash(node:*)", "Bash(npx playwright:*)", "Bash(curl:*)"
 // prepareE2E creates the evidence dir (outside the worktree, never committed) and hands the
 // agent the app, the credentials profile and the file path — never the credential values.
 // The agent's file tools are denied on the credentials file; only its scripts read it.
-func (w *Worker) prepareE2E(log *slog.Logger, spec *agent.ClaudeSpec, repo repos.Repo, jobDir string) (*agent.E2E, error) {
+// first = the first E2E repo of the group: the E2E_* env vars describe it.
+func (w *Worker) prepareE2E(log *slog.Logger, spec *agent.ClaudeSpec, repo repos.Repo, jobDir string, first bool) (*agent.E2E, error) {
 	evDir, err := filepath.Abs(filepath.Join(jobDir, "evidence"))
 	if err != nil {
 		return nil, err
@@ -474,8 +611,11 @@ func (w *Worker) prepareE2E(log *slog.Logger, spec *agent.ClaudeSpec, repo repos
 	}
 	e := &agent.E2E{BaseURL: repo.E2E.BaseURL, StartCmd: repo.E2E.StartCmd, Profile: repo.E2E.CredentialsProfile,
 		Notes: repo.E2E.Notes, EvidenceDir: evDir}
-	spec.AllowedTools = append(append([]string{}, repo.AllowedTools...), e2eTools...)
+	spec.AllowedTools = appendNew(spec.AllowedTools, e2eTools...)
 	spec.AddDirs = append(spec.AddDirs, evDir)
+	if !first {
+		return e, nil
+	}
 	// "//" marks an absolute path in Claude Code permission rules.
 	spec.Disallowed = append(spec.Disallowed, "Read(/"+cred+")", "Edit(/"+cred+")", "Write(/"+cred+")")
 	spec.Env = append(spec.Env, "E2E_BASE_URL="+e.BaseURL, "E2E_START_CMD="+e.StartCmd, "E2E_PROFILE="+e.Profile,

@@ -8,11 +8,13 @@ services:
     environment:
       DB_PATH: /data/tasks.db # overrides the host path from .env
       REPOS_FILE: /config/repos.json
+      SCOPE_FILE: /config/scope.json
     # Run as the host user so the bind-mounted ./data stays writable/owned by you.
     user: "${UID:-1000}:${GID:-1000}"
     volumes:
       - ./data:/data
       - ./repos.json:/config/repos.json:ro # create it first: `make up` does
+      - ./scope.json:/config/scope.json:ro # scope-comment format; `make up` copies scope.example.json
     mem_limit: 64m
     cpus: 0.25
     read_only: true

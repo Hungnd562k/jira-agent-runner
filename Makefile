@@ -30,7 +30,7 @@ index:
 
 # Docker (see docker-compose.yml). Stop any local `make run` first: one bot token = one poller.
 .PHONY: up down logs
-up: repos.json
+up: repos.json scope.json
 	docker compose up -d --build
 
 down:
@@ -42,6 +42,11 @@ logs:
 # Bind mount needs the file to exist; start with no repos (Fix it just approves).
 repos.json:
 	echo '{}' > repos.json
+
+# Scope-comment format (marker + fields "Fix it" requires); edit it freely, no rebuild needed
+# (restart the notifier and worker to reload).
+scope.json:
+	cp scope.example.json scope.json
 
 # Agent worker runs on the host (needs claude CLI, git SSH access, repo toolchains).
 .PHONY: worker worker-local

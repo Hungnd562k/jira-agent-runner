@@ -17,9 +17,10 @@ import (
 
 // Comment is a Jira issue comment.
 type Comment struct {
-	Author  string
-	Body    string
-	Created time.Time
+	Author     string // display name
+	AuthorName string // Jira username
+	Body       string
+	Created    time.Time
 }
 
 // IssueDetail is the full context handed to the coding agent.
@@ -29,11 +30,8 @@ type IssueDetail struct {
 	Description string
 	Components  []string
 	Labels      []string
-	Comments    []Comment // most recent last, capped by GetIssue
+	Comments    []Comment // all comments, most recent last (the prompt keeps only the latest few)
 }
-
-// maxComments caps how many of the latest comments are kept (prompt size).
-const maxComments = 5
 
 type issueResponse struct {
 	Key    string `json:"key"`
@@ -51,6 +49,7 @@ type issueResponse struct {
 				Body    string `json:"body"`
 				Created string `json:"created"`
 				Author  *struct {
+					Name        string `json:"name"`
 					DisplayName string `json:"displayName"`
 				} `json:"author"`
 			} `json:"comments"`
@@ -58,7 +57,7 @@ type issueResponse struct {
 	} `json:"fields"`
 }
 
-// GetIssue fetches one issue with description, components and the latest comments.
+// GetIssue fetches one issue with description, components and its comments.
 func (c *Client) GetIssue(ctx context.Context, key string) (IssueDetail, error) {
 	q := url.Values{}
 	q.Set("fields", "summary,description,issuetype,priority,status,components,labels,comment,updated")
@@ -103,14 +102,10 @@ func (c *Client) GetIssue(ctx context.Context, key string) (IssueDetail, error) 
 		d.Components = append(d.Components, comp.Name)
 	}
 	if f.Comment != nil {
-		cs := f.Comment.Comments
-		if len(cs) > maxComments {
-			cs = cs[len(cs)-maxComments:]
-		}
-		for _, cm := range cs {
+		for _, cm := range f.Comment.Comments {
 			out := Comment{Body: cm.Body, Created: parseTime(cm.Created)}
 			if cm.Author != nil {
-				out.Author = cm.Author.DisplayName
+				out.Author, out.AuthorName = cm.Author.DisplayName, cm.Author.Name
 			}
 			d.Comments = append(d.Comments, out)
 		}

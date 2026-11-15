@@ -19,6 +19,7 @@ import (
 	"github.com/Hungnd562k/jira-agent-runner/internal/jira"
 	"github.com/Hungnd562k/jira-agent-runner/internal/repos"
 	"github.com/Hungnd562k/jira-agent-runner/internal/scheduler"
+	"github.com/Hungnd562k/jira-agent-runner/internal/scope"
 	"github.com/Hungnd562k/jira-agent-runner/internal/store"
 	"github.com/Hungnd562k/jira-agent-runner/internal/telegram"
 
@@ -70,8 +71,9 @@ func run(log *slog.Logger, once, dryRun bool) error {
 	}
 	defer st.Close()
 
+	jc := jira.New(cfg.JiraBaseURL, cfg.JiraPAT)
 	syncer := &scheduler.Syncer{
-		Source: jira.New(cfg.JiraBaseURL, cfg.JiraPAT),
+		Source: jc,
 		Store:  st,
 		JQL:    cfg.JiraJQL,
 		Now:    time.Now,
@@ -94,6 +96,11 @@ func run(log *slog.Logger, once, dryRun bool) error {
 		return fmt.Errorf("load repos: %w", err)
 	}
 	log.Info("repos loaded", "file", cfg.ReposFile, "projects", len(repoCfg))
+	scopeFmt, err := scope.Load(cfg.ScopeFile)
+	if err != nil {
+		return fmt.Errorf("load scope format: %w", err)
+	}
+	log.Info("scope format loaded", "file", cfg.ScopeFile, "marker", scopeFmt.Marker, "fields", len(scopeFmt.Fields))
 
 	svc := &scheduler.Service{
 		Syncer:          syncer,
@@ -102,6 +109,8 @@ func run(log *slog.Logger, once, dryRun bool) error {
 		ChatID:          cfg.TelegramChatID,
 		SnoozeChoices:   cfg.SnoozeChoices,
 		Repos:           repoCfg,
+		Issues:          jc,
+		Scope:           scopeFmt,
 		PollInterval:    cfg.PollInterval,
 		RemindAfter:     cfg.RemindInterval,
 		HandoverTimeout: cfg.PipelineTimeout,

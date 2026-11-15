@@ -16,6 +16,7 @@ import (
 	"github.com/Hungnd562k/jira-agent-runner/internal/gitlab"
 	"github.com/Hungnd562k/jira-agent-runner/internal/jira"
 	"github.com/Hungnd562k/jira-agent-runner/internal/repos"
+	"github.com/Hungnd562k/jira-agent-runner/internal/scope"
 	"github.com/Hungnd562k/jira-agent-runner/internal/store"
 	"github.com/Hungnd562k/jira-agent-runner/internal/telegram"
 	"github.com/Hungnd562k/jira-agent-runner/internal/worker"
@@ -38,6 +39,10 @@ func runWorker(log *slog.Logger, once, noPush bool, publishJob int64) error {
 	if err != nil {
 		return fmt.Errorf("load repos: %w", err)
 	}
+	scopeFmt, err := scope.Load(cfg.ScopeFile)
+	if err != nil {
+		return fmt.Errorf("load scope format: %w", err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -52,6 +57,7 @@ func runWorker(log *slog.Logger, once, noPush bool, publishJob int64) error {
 	w := &worker.Worker{
 		Store:  st,
 		Repos:  repoCfg,
+		Scope:  scopeFmt,
 		Jira:   jc,
 		TG:     telegram.New(telegramAPI, cfg.TelegramBotToken),
 		ChatID: cfg.TelegramChatID,

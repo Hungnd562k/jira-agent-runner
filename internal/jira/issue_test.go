@@ -20,7 +20,7 @@ func TestGetIssue(t *testing.T) {
 		}
 		var comments []string
 		for i := range 7 {
-			comments = append(comments, fmt.Sprintf(`{"body":"c%d","created":"2026-11-10T10:00:00.000+0700","author":{"displayName":"Dev %d"}}`, i, i))
+			comments = append(comments, fmt.Sprintf(`{"body":"c%d","created":"2026-11-10T10:00:00.000+0700","author":{"name":"dev%d","displayName":"Dev %d"}}`, i, i, i))
 		}
 		fmt.Fprintf(w, `{"key":"X-1","fields":{"summary":"Crash on save","description":"Steps: 1. open 2. save",
 			"updated":"2026-11-10T10:00:00.000+0700","labels":["backend"],"issuetype":{"name":"Bug"},
@@ -37,7 +37,7 @@ func TestGetIssue(t *testing.T) {
 		!strings.Contains(d.Description, "Steps") || d.URL != srv.URL+"/browse/X-1" {
 		t.Errorf("detail = %+v", d)
 	}
-	if len(d.Comments) != maxComments || d.Comments[0].Body != "c2" || d.Comments[4].Author != "Dev 6" {
+	if len(d.Comments) != 7 || d.Comments[0].Body != "c0" || d.Comments[6].Author != "Dev 6" || d.Comments[6].AuthorName != "dev6" {
 		t.Errorf("comments = %+v", d.Comments)
 	}
 

@@ -7,6 +7,7 @@ Required for this job. The fix is not complete until the fixed build is checked 
 - `EVIDENCE_DIR` absolute, outside the repo: put scripts, screenshots, logs and `e2e.json` here, never in the repo.
 - `E2E_CREDENTIALS_FILE` + `E2E_PROFILE`: JSON `{"profiles": {"<name>": {"role": "...", "web": {"base_url", "username", "password"}}}}`.
 - `NODE_PATH` resolves `require('playwright')` when configured.
+- Several repos may require E2E: verify each one. The env vars describe the first; for the others use the app URL, start command, profile and evidence dir given for that repo in the task. Each repo has its own evidence dir and its own `e2e.json`.
 
 ## Credentials (hard rules)
 - Never Read, cat, print, log or echo the credentials file or its values. Load them only inside the Node script:

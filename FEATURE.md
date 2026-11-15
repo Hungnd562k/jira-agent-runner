@@ -41,7 +41,7 @@ Danh sách các khả năng của service, chia theo PR đã merge vào `main`. 
 | # | Nhóm | Khả năng | Chi tiết | Commit |
 |---|---|---|---|---|
 | 2.1 | Cấu hình | Map Jira project → repo | `repos.json` (`REPOS_FILE`, git-ignore, mount read-only vào container): mỗi project có nhiều repo ứng viên `{name, gitlab_project, path, base_branch, test_cmd, allowed_tools}` | P2.1 `f816536` |
-| 2.2 | Telegram | Fix it theo số repo | 0 repo → chỉ `approved` ("no repo configured"); 1 repo → `approved` + job `queued` trong cùng 1 transaction; >1 repo → hiện nút chọn repo + Back | P2.1 |
+| 2.2 | Telegram | Fix it theo số repo (đã thay bởi 2.23) | 0 repo → chỉ `approved` ("no repo configured"); 1 repo → `approved` + job `queued` trong cùng 1 transaction; >1 repo → hiện nút chọn repo + Back | P2.1 |
 | 2.3 | Lưu trữ | Hàng đợi job | Bảng `jobs` (migration 002): `queued → running → succeeded / failed`, lưu `branch`, `mr_url`, `error`, `tests_passed` | P2.1 |
 | 2.4 | Telegram | Tiến độ trên notice | Notice đã approve hiện trạng thái job mới nhất: Queued / Agent running / Done + Draft MR + tests / Failed | P2.1 |
 | 2.5 | Worker | Process worker chạy trên host | `runner --worker [--once] [--no-push]`: lấy từng job một; khi khởi động, job còn kẹt ở `running` bị đánh dấu `failed: interrupted`. Dùng chung `data/tasks.db` với notifier, **không gọi `getUpdates`** nên không đụng long polling | P2.2–P2.4 `a6e2770` |
@@ -58,10 +58,11 @@ Danh sách các khả năng của service, chia theo PR đã merge vào `main`. 
 | 2.16 | Git | Worktree đặt cạnh repo clone | Mặc định `<parent>/.agent-<repo>-<KEY>-j<id>` để các tham chiếu `../../other-repo/*.csproj` vẫn build được; `WORKTREE_DIR` để ghi đè. Copy `CLAUDE.md` / `AGENTS.md` / `CLAUDE.local.md` đang bị git-ignore vào để agent theo đúng hướng dẫn dự án (không bao giờ bị commit) | `f061da3` |
 | 2.17 | Báo cáo | Report cho mỗi job | `data/jobs/<id>/report.md`, `agent.json`, `test.log`; reply trên Telegram gồm repo, branch (hoặc `git -C <path> show <branch>`) / link MR, tests, chi phí, diff stat, báo cáo của agent | `8e882f7` |
 | 2.18 | Jira | Comment lên issue | Khi có Draft MR: comment wiki markup với link MR, branch, tests, báo cáo agent. **Không bao giờ đổi status Jira** | `8e882f7` |
-| 2.19 | Telegram | Retry / Other repo | Job đã xong (Done/Failed) có nút **🔁 Retry** (cùng repo, branch mới `-j<newid>`) và **📦 Other repo**; mỗi task chỉ có tối đa 1 job queued/running. Notifier vẽ lại notice approved khi khởi động để nút mới xuất hiện | `8e882f7` |
+| 2.19 | Telegram | Retry / Other repo (Other repo đã bỏ, xem 2.23) | Job đã xong (Done/Failed) có nút **🔁 Retry** (cùng repo, branch mới `-j<newid>`) và **📦 Other repo**; mỗi task chỉ có tối đa 1 job queued/running. Notifier vẽ lại notice approved khi khởi động để nút mới xuất hiện | `8e882f7` |
 | 2.20 | Phục hồi | Báo cả khi fail sau commit | Push/MR lỗi sau khi đã commit → job `failed` nhưng Telegram vẫn báo branch nằm đâu và lỗi ở bước nào | `78b6242` |
 | 2.21 | Phục hồi | `--publish-job <id>` | Push nếu cần, mở Draft MR, đánh dấu job succeeded, report + comment Jira; **không chạy lại agent** | `78b6242` |
 | 2.22 | Tài liệu | Quick start Phase 2 | README: cách setup `repos.json`, GitLab token, chạy worker | `ae47fe5` |
+| 2.23 | Telegram + Worker | Phạm vi sửa từ comment maintainer, job nhiều repo | Fix it/Retry đọc comment `@CLAUDE/CODEX` (`repo_dependencies`, `specs`, `hints`; format trong `scope.json`, sửa không cần code). Thiếu/sai → bot reply hướng dẫn + mẫu copy-paste đã điền sẵn repo. Hợp lệ → 1 nhóm job (mỗi repo 1 job), 1 phiên agent trên mọi worktree, có guard rules chỉ sửa trong phạm vi; test/MR/merge/bàn giao vẫn theo từng repo | branch này |
 
 **Đã kiểm thử thật:** smoke test `claude -p` CLI thật; job HDBCD-2705 trên `cd-boclient-web` (`--no-push`): sửa `BaseFormTextArea.razor` + thêm test mới, 70/70 test pass, test mới fail trên code cũ; GitLab token có quyền Maintainer trên cả 6 repo; job push đầu tiên bị lỗi 403 `insufficient_scope`, đã phục hồi bằng `--publish-job 3` → Draft MR !633 target `dev` + comment Jira.
 
@@ -92,7 +93,7 @@ Danh sách các khả năng của service, chia theo PR đã merge vào `main`. 
 |---|---|
 | MVP (#1) | `JIRA_BASE_URL`, `JIRA_PAT`, `JIRA_JQL`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `POLL_INTERVAL` (5m), `REMIND_INTERVAL` (4h), `SNOOZE_CHOICES` (30m,2h,24h), `DB_PATH` |
 | E2E + bàn giao (branch) | `E2E_CREDENTIALS_FILE`, `E2E_NODE_PATH`, `HANDOVER_MIN_TICKETS`, `PIPELINE_POLL_INTERVAL`, `PIPELINE_START_TIMEOUT`, `PIPELINE_TIMEOUT`, `JIRA_HANDOVER_STATUS`, `JIRA_RESOLUTION` |
-| Phase 2 (#2) | `REPOS_FILE`, `GITLAB_BASE_URL`, `GITLAB_TOKEN` (scope `api`), `WORKTREE_DIR`, `CLAUDE_BIN`, `AGENT_TIMEOUT` (30m), `AGENT_MAX_BUDGET_USD` (5), `AGENT_MODEL`, `TEST_TIMEOUT` (15m) |
+| Phase 2 (#2) | `REPOS_FILE`, `SCOPE_FILE`, `GITLAB_BASE_URL`, `GITLAB_TOKEN` (scope `api`), `WORKTREE_DIR`, `CLAUDE_BIN`, `AGENT_TIMEOUT` (30m), `AGENT_MAX_BUDGET_USD` (5), `AGENT_MODEL`, `TEST_TIMEOUT` (15m) |
 
 ## Chưa làm / ngoài phạm vi hiện tại
 
